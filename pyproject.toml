@@ -1,0 +1,9 @@
+[project]
+name = "ai-agent-orchestrator"
+version = "0.1.0"
+description = "Framework-free, in-house AI agent orchestrator with Claude as the default LLM provider."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

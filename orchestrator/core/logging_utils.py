@@ -20,11 +20,17 @@ VALID_TAGS = {
     "ROUTER",
     "TASK",
     "AGENT",
-    "TOOL",
     "EVALUATOR",
     "RETRY",
     "REPLAN",
     "COMPLETE",
+    # Fine-grained tool runtime lifecycle (Phase 2).
+    "TOOL_REQUEST",
+    "TOOL_VALIDATION",
+    "TOOL_PERMISSION",
+    "TOOL_EXECUTION",
+    "TOOL_RESULT",
+    "TOOL_ERROR",
 }
 
 _logger = logging.getLogger("orchestrator")
@@ -42,6 +48,7 @@ class Event:
     timestamp: float = field(default_factory=time.time)
     task_id: str | None = None
     agent_id: str | None = None
+    tool_id: str | None = None
     model: str | None = None
     duration_ms: float | None = None
     status: str | None = None
@@ -60,6 +67,7 @@ class Event:
         for key in (
             "task_id",
             "agent_id",
+            "tool_id",
             "model",
             "duration_ms",
             "status",
@@ -90,7 +98,7 @@ class EventLog:
         self.events.append(event)
         if self.verbose:
             suffix_bits = []
-            for key in ("task_id", "agent_id", "status", "retry_count", "duration_ms"):
+            for key in ("task_id", "agent_id", "tool_id", "status", "retry_count", "duration_ms"):
                 value = getattr(event, key)
                 if value is not None:
                     suffix_bits.append(f"{key}={value}")

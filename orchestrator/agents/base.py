@@ -43,6 +43,12 @@ class BaseAgent(ABC):
     description: ClassVar[str]
     capabilities: ClassVar[list[str]] = []
     available_tools: ClassVar[list[str]] = []
+    # Permissions this agent holds (e.g. "filesystem.read"). The ToolRuntime
+    # checks these against a tool's declared required permissions - an
+    # agent listing a tool in ``available_tools`` without the matching
+    # permission will have its tool calls rejected at execution time, not
+    # just hidden from the prompt.
+    permissions: ClassVar[list[str]] = []
     system_instructions: ClassVar[str] = ""
 
     input_schema: ClassVar[dict[str, Any]] = {
@@ -81,4 +87,5 @@ class BaseAgent(ABC):
             "description": self.description,
             "capabilities": self.capabilities,
             "available_tools": self.available_tools,
+            "permissions": self.permissions,
         }

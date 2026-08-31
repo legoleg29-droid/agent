@@ -28,10 +28,31 @@ class ContextManager:
     def __init__(self, goal: str, started_at: float) -> None:
         self.global_context: dict[str, Any] = {}
         self.task_outputs: dict[str, AgentOutput] = {}
+        # Structured tool-call history, e.g.
+        # {"tool": "calculator", "status": "success", "result": ..., "task_id": ..., "timestamp": ...}
+        # Never raw/unstructured tool output dumped into global_context.
+        self.tool_results: list[dict[str, Any]] = []
         self.metadata = ExecutionMetadata(goal=goal, started_at=started_at)
 
     def record_task_output(self, task_id: str, output: AgentOutput) -> None:
         self.task_outputs[task_id] = output
+
+    def record_tool_result(
+        self,
+        *,
+        tool: str,
+        status: str,
+        task_id: str | None,
+        timestamp: float,
+        result: Any = None,
+        error: str | None = None,
+    ) -> None:
+        entry: dict[str, Any] = {"tool": tool, "status": status, "task_id": task_id, "timestamp": timestamp}
+        if status == "success":
+            entry["result"] = result
+        else:
+            entry["error"] = error
+        self.tool_results.append(entry)
 
     def upstream_outputs_for(self, task: Task, graph: TaskGraph) -> dict[str, str]:
         """Only the direct dependency outputs, not the entire run history."""

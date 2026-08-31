@@ -24,7 +24,7 @@ def build_orchestrator():
     registry.register(research)
     registry.register(analysis)
 
-    provider = MockProvider(responder=lambda system, messages: json.dumps(PLAN) if messages[-1].content.startswith("User goal:") else "Final synthesized result.")
+    provider = MockProvider(responder=lambda system, messages, tools: json.dumps(PLAN) if messages[-1].content.startswith("User goal:") else "Final synthesized result.")
     orchestrator = Orchestrator(provider, registry, ToolRegistry(), verbose_logging=False)
     return orchestrator, research, analysis
 
@@ -65,7 +65,7 @@ async def test_independent_tasks_execute_without_a_router_error():
             {"id": "x2", "objective": "branch b", "capability": "writing", "dependencies": [], "required_tools": []},
         ]
     }
-    provider = MockProvider(responder=lambda s, m: json.dumps(plan) if m[-1].content.startswith("User goal:") else "final")
+    provider = MockProvider(responder=lambda s, m, t: json.dumps(plan) if m[-1].content.startswith("User goal:") else "final")
     orchestrator = Orchestrator(provider, registry, ToolRegistry(), verbose_logging=False)
     result = await orchestrator.run("do two independent things")
 

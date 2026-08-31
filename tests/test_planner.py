@@ -8,7 +8,7 @@ from orchestrator.providers.mock_provider import MockProvider
 
 
 def make_planner(plan_json: dict) -> Planner:
-    provider = MockProvider(responder=lambda system, messages: json.dumps(plan_json))
+    provider = MockProvider(responder=lambda system, messages, tools: json.dumps(plan_json))
     return Planner(provider)
 
 
@@ -66,7 +66,7 @@ async def test_plan_rejects_cycles():
 
 @pytest.mark.asyncio
 async def test_plan_rejects_non_json_response():
-    provider = MockProvider(responder=lambda s, m: "I refuse to produce JSON today.")
+    provider = MockProvider(responder=lambda s, m, t: "I refuse to produce JSON today.")
     planner = Planner(provider)
     with pytest.raises(PlanParseError):
         await planner.plan("Do X", capabilities=["research"], tools=[])

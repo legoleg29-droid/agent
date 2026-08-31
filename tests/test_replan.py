@@ -22,7 +22,7 @@ REPLAN = {
 
 
 def responder_factory(replanned: dict):
-    def _respond(system, messages):
+    def _respond(system, messages, tools):
         last = messages[-1].content
         if last.startswith("User goal:"):
             return json.dumps(INITIAL_PLAN)

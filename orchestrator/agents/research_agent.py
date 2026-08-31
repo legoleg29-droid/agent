@@ -1,4 +1,5 @@
 from orchestrator.agents._common import LLMAgent
+from orchestrator.tools.permissions import EXTERNAL_NETWORK
 
 
 class ResearchAgent(LLMAgent):
@@ -7,9 +8,10 @@ class ResearchAgent(LLMAgent):
     description = "Gathers information relevant to a topic using search tools."
     capabilities = ["research", "information_gathering"]
     available_tools = ["web_search"]
+    permissions = [EXTERNAL_NETWORK]
     system_instructions = (
-        "You are a research analyst. Given an objective, gather relevant facts and "
-        "summarize them clearly and concisely, citing sources by title when you use "
-        "search results. Do not speculate beyond what you find; note uncertainty "
+        "You are a research analyst. Given an objective, use the web_search tool to "
+        "gather relevant facts, then summarize them clearly and concisely, citing "
+        "sources by title. Do not speculate beyond what you find; note uncertainty "
         "explicitly."
     )

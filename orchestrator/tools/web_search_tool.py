@@ -3,7 +3,7 @@
 This is a deliberately minimal placeholder: it searches a small local
 in-memory corpus so the orchestrator is runnable offline and in tests
 without external API keys. In production, swap the ``_search`` method (or
-register a different tool under the same name) to call a real search API
+register a different tool under the same id) to call a real search API
 or an MCP-exposed search server - agents and the orchestrator do not need
 to change, since they only depend on the ``BaseTool`` interface.
 """
@@ -11,6 +11,7 @@ to change, since they only depend on the ``BaseTool`` interface.
 from __future__ import annotations
 
 from orchestrator.tools.base import BaseTool, ToolResult
+from orchestrator.tools.permissions import EXTERNAL_NETWORK
 
 _DEMO_CORPUS = [
     {
@@ -45,7 +46,8 @@ _DEMO_CORPUS = [
 
 
 class WebSearchTool(BaseTool):
-    name = "web_search"
+    id = "web_search"
+    name = "Web Search"
     description = (
         "Searches for information relevant to a query and returns matching snippets. "
         "Example/demo implementation backed by a small local corpus - replace with a "
@@ -55,10 +57,21 @@ class WebSearchTool(BaseTool):
         "type": "object",
         "properties": {
             "query": {"type": "string"},
-            "max_results": {"type": "integer", "default": 3},
+            "max_results": {"type": "integer"},
         },
         "required": ["query"],
     }
+    output_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "results": {"type": "array"},
+        },
+        "required": ["query", "results"],
+    }
+    permissions = [EXTERNAL_NETWORK]  # represents "would call an external search API" in production
+    capabilities = ["search", "research"]
+    timeout_seconds = 15.0
 
     async def execute(self, *, query: str, max_results: int = 3) -> ToolResult:
         if not query or not query.strip():

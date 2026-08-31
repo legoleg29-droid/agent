@@ -10,7 +10,7 @@ from __future__ import annotations
 import ast
 import operator
 
-from orchestrator.tools.base import BaseTool, ToolResult
+from orchestrator.tools.base import BaseTool, ToolErrorCode, ToolResult
 
 _ALLOWED_OPS = {
     ast.Add: operator.add,
@@ -35,18 +35,31 @@ def _eval_node(node: ast.AST) -> float:
 
 
 class CalculatorTool(BaseTool):
-    name = "calculator"
-    description = "Evaluates a basic arithmetic expression (+ - * / % **) and returns the result."
+    id = "calculator"
+    name = "Calculator"
+    description = "Evaluates a basic arithmetic expression (+ - * / % **) and returns the numeric result."
     input_schema = {
         "type": "object",
         "properties": {"expression": {"type": "string"}},
         "required": ["expression"],
     }
+    output_schema = {
+        "type": "object",
+        "properties": {"result": {"type": "number"}},
+        "required": ["result"],
+    }
+    permissions: list[str] = []  # pure computation, no filesystem/network access
+    capabilities = ["math", "compute"]
+    timeout_seconds = 5.0
 
     async def execute(self, *, expression: str) -> ToolResult:
         try:
             tree = ast.parse(expression, mode="eval")
             value = _eval_node(tree.body)
-            return ToolResult(success=True, output=value)
+            return ToolResult(success=True, output={"result": value})
         except Exception as exc:  # noqa: BLE001
-            return ToolResult(success=False, error=f"Invalid expression: {exc}")
+            return ToolResult(
+                success=False,
+                error=f"Invalid expression: {exc}",
+                error_code=ToolErrorCode.INVALID_ARGUMENTS,
+            )

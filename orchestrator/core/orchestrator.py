@@ -13,10 +13,10 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 
-from orchestrator.agents.base import AgentInput, AgentOutput
+from orchestrator.agents.base import AgentInput, AgentOutput, BaseAgent
 from orchestrator.agents.registry import AgentRegistry
 from orchestrator.core.context import ContextManager
-from orchestrator.core.evaluator import Evaluator, Verdict
+from orchestrator.core.evaluator import Evaluator
 from orchestrator.core.logging_utils import EventLog
 from orchestrator.core.planner import Planner
 from orchestrator.core.retry import Action, RetryPolicy
@@ -35,6 +35,7 @@ class OrchestrationResult:
     final_output: str
     graph: TaskGraph
     events: list[dict] = field(default_factory=list)
+    tool_results: list[dict] = field(default_factory=list)
     succeeded: bool = True
 
 
@@ -70,7 +71,7 @@ class Orchestrator:
         # PLAN
         self.state.transition(RunStatus.PLANNING)
         capabilities = self.agent_registry.all_capabilities()
-        tools = [t.name for t in self.tool_registry.list_tools()]
+        tools = [t.id for t in self.tool_registry.list_tools()]
         graph = await self.planner.plan(goal, capabilities=capabilities, tools=tools)
         for task in graph.tasks.values():
             task.max_retries = self.max_retries_per_task
@@ -114,6 +115,7 @@ class Orchestrator:
             final_output=final_output,
             graph=graph,
             events=[e.to_dict() for e in self.event_log.events],
+            tool_results=context.tool_results,
             succeeded=succeeded,
         )
 
@@ -129,15 +131,30 @@ class Orchestrator:
 
         started = time.perf_counter()
         self.event_log.emit("TASK", f"Starting task '{task.id}'", task_id=task.id, agent_id=agent.id, status="running")
-        try:
-            output = await agent.execute(agent_input)
-        except Exception as exc:  # noqa: BLE001 - agent crashes are a failure mode to evaluate, not a crash
-            output = AgentOutput(success=False, error=f"{type(exc).__name__}: {exc}")
+
+        availability_error = self._validate_tool_requirements(task, agent)
+        events_before = len(self.event_log.events)
+        if availability_error:
+            self.event_log.emit(
+                "TASK",
+                f"Task '{task.id}' failed pre-execution validation: {availability_error}",
+                task_id=task.id,
+                agent_id=agent.id,
+                status="failed",
+                error=availability_error,
+            )
+            output = AgentOutput(success=False, error=availability_error)
+        else:
+            try:
+                output = await agent.execute(agent_input)
+            except Exception as exc:  # noqa: BLE001 - agent crashes are a failure mode to evaluate, not a crash
+                output = AgentOutput(success=False, error=f"{type(exc).__name__}: {exc}")
         duration_ms = (time.perf_counter() - started) * 1000
 
         task.result = output
         task.error = output.error
         context.record_task_output(task.id, output)
+        self._record_tool_results(task.id, events_before, context)
 
         self.event_log.emit(
             "AGENT",
@@ -181,6 +198,37 @@ class Orchestrator:
 
         return action
 
+    def _validate_tool_requirements(self, task: Task, agent: BaseAgent) -> str | None:
+        """Fail fast, before any LLM call, if the required tools aren't
+        actually usable - unregistered, not declared on the routed agent,
+        or the agent lacks a required permission. Mirrors what ToolRuntime
+        would reject anyway, but avoids wasting a model call on a task
+        that's guaranteed to fail at the tool-call step.
+        """
+        for tool_id in task.required_tools:
+            if not self.tool_registry.is_available(tool_id):
+                return f"Required tool '{tool_id}' is not registered in the ToolRegistry"
+            if tool_id not in agent.available_tools:
+                return f"Agent '{agent.id}' does not declare required tool '{tool_id}' in available_tools"
+            tool = self.tool_registry.get(tool_id)
+            missing = [p for p in tool.permissions if p not in agent.permissions]
+            if missing:
+                return f"Agent '{agent.id}' lacks permission(s) {missing} required by tool '{tool_id}'"
+        return None
+
+    def _record_tool_results(self, task_id: str, events_since_index: int, context: ContextManager) -> None:
+        for event in self.event_log.events[events_since_index:]:
+            if event.tag not in ("TOOL_RESULT", "TOOL_ERROR") or event.task_id != task_id:
+                continue
+            context.record_tool_result(
+                tool=event.tool_id or "unknown",
+                status="success" if event.tag == "TOOL_RESULT" and event.status == "success" else "failure",
+                task_id=event.task_id,
+                timestamp=event.timestamp,
+                result=event.extra.get("output") if event.status == "success" else None,
+                error=event.error,
+            )
+
     async def _replan(self, goal: str, graph: TaskGraph, context: ContextManager, failed_task: Task) -> bool:
         if not self.state.can_replan():
             return False
@@ -188,7 +236,7 @@ class Orchestrator:
         self.state.record_replan()
 
         capabilities = self.agent_registry.all_capabilities()
-        tools = [t.name for t in self.tool_registry.list_tools()]
+        tools = [t.id for t in self.tool_registry.list_tools()]
         completed_summary = context.completed_summary(graph)
 
         new_tasks = await self.planner.replan(

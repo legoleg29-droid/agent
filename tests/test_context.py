@@ -43,3 +43,27 @@ def test_global_context_is_separate_from_task_outputs():
 
     assert context.global_context == {"run_id": "abc123"}
     assert "run_id" not in context.task_outputs
+
+
+def test_tool_results_are_structured_not_dumped_into_global_context():
+    context = ContextManager(goal="goal", started_at=time.time())
+    context.record_tool_result(
+        tool="calculator", status="success", task_id="t1", timestamp=time.time(), result={"result": 4}
+    )
+    context.record_tool_result(
+        tool="web_search", status="failure", task_id="t2", timestamp=time.time(), error="timed out"
+    )
+
+    assert len(context.tool_results) == 2
+    success_entry, failure_entry = context.tool_results
+    assert success_entry == {
+        "tool": "calculator",
+        "status": "success",
+        "task_id": "t1",
+        "timestamp": success_entry["timestamp"],
+        "result": {"result": 4},
+    }
+    assert failure_entry["status"] == "failure"
+    assert failure_entry["error"] == "timed out"
+    # tool results never leak into unrelated global context
+    assert "tool_results" not in context.global_context

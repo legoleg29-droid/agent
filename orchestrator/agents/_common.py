@@ -1,99 +1,116 @@
 """Shared helpers for LLM-backed agents.
 
 Not part of the public BaseAgent contract - just a convenience base class
-so the four example agents don't duplicate prompt plumbing and the
-tool-request protocol.
+so the example agents don't duplicate prompt plumbing and the tool-use
+loop.
+
+Tool use goes through the provider's native structured mechanism (Claude's
+``tool_use``/``tool_result`` blocks) rather than parsing free text: the
+agent hands the provider a set of tool schemas, and if the model decides
+to use one, the response carries a structured ``ToolCallRequest`` instead
+of text. This class drives that loop, executing each requested tool via
+``ToolRuntime`` (which enforces this agent's permissions) and feeding the
+result back until the model produces a final text answer.
 """
 
 from __future__ import annotations
 
 import json
-import re
 
 from orchestrator.agents.base import AgentInput, AgentOutput, BaseAgent
 from orchestrator.providers.base import LLMMessage
 
-_TOOL_CALL_RE = re.compile(r"TOOL_CALL:\s*(\w+)\((\{.*?\})\)", re.DOTALL)
+MAX_TOOL_ROUNDS = 4
 
 
 class LLMAgent(BaseAgent):
-    """Base class that wires an agent's system instructions + objective
-    through the provider, with one optional round of tool use.
-
-    Protocol: the agent may respond with a line like
-    ``TOOL_CALL: web_search({"query": "..."})`` to request a tool. The
-    runtime executes it, the result is fed back, and the agent produces
-    its final answer. This keeps tool use explicit and provider-agnostic
-    instead of depending on a specific vendor's function-calling schema.
-    """
-
     async def execute(self, agent_input: AgentInput) -> AgentOutput:
-        prompt = self._build_prompt(agent_input)
-        messages = [LLMMessage(role="user", content=prompt)]
+        messages: list[LLMMessage] = [LLMMessage(role="user", content=self._build_prompt(agent_input))]
+        tool_schemas = self._tool_schemas()
         tool_calls_made = 0
         tokens_used = 0
+        model: str | None = None
 
-        response = await self.provider.complete(
-            system=self._system_prompt(), messages=messages
-        )
-        tokens_used += response.total_tokens
+        for _round in range(MAX_TOOL_ROUNDS):
+            response = await self.provider.complete(
+                system=self.system_instructions,
+                messages=messages,
+                tools=tool_schemas or None,
+            )
+            tokens_used += response.total_tokens
+            model = response.model
 
-        match = _TOOL_CALL_RE.search(response.text)
-        if match and self.tool_runtime and self.available_tools:
-            tool_name, raw_args = match.group(1), match.group(2)
-            if tool_name in self.available_tools:
-                try:
-                    args = json.loads(raw_args)
-                except json.JSONDecodeError as exc:
+            if not response.tool_calls:
+                content = response.text.strip()
+                if not content:
                     return AgentOutput(
                         success=False,
-                        error=f"Agent requested tool '{tool_name}' with invalid JSON args: {exc}",
+                        error="Agent produced empty output",
+                        tool_calls=tool_calls_made,
                         tokens_used=tokens_used,
-                        model=response.model,
+                        model=model,
                     )
-                tool_result = await self.tool_runtime.call(
-                    tool_name, task_id=agent_input.task_context.get("task_id"), agent_id=self.id, **args
+                return AgentOutput(
+                    success=True,
+                    content=content,
+                    tool_calls=tool_calls_made,
+                    tokens_used=tokens_used,
+                    model=model,
                 )
-                tool_calls_made += 1
-                follow_up = (
-                    f"Tool `{tool_name}` returned: "
-                    f"{tool_result.output if tool_result.success else 'ERROR: ' + str(tool_result.error)}\n\n"
-                    "Now produce your final answer for the objective, incorporating this result. "
-                    "Do not request another tool."
-                )
-                messages.append(LLMMessage(role="assistant", content=response.text))
-                messages.append(LLMMessage(role="user", content=follow_up))
-                response = await self.provider.complete(
-                    system=self._system_prompt(), messages=messages
-                )
-                tokens_used += response.total_tokens
 
-        content = response.text.strip()
-        if not content:
-            return AgentOutput(
-                success=False,
-                error="Agent produced empty output",
-                tool_calls=tool_calls_made,
-                tokens_used=tokens_used,
-                model=response.model,
-            )
+            if not self.tool_runtime:
+                return AgentOutput(
+                    success=False,
+                    error="Agent requested a tool but has no ToolRuntime configured",
+                    tool_calls=tool_calls_made,
+                    tokens_used=tokens_used,
+                    model=model,
+                )
+
+            # Replay the assistant's turn verbatim (including tool_use
+            # blocks) so the next request carries full tool-use context.
+            messages.append(LLMMessage(role="assistant", content=response.content_blocks or response.text))
+
+            tool_result_blocks = []
+            for call in response.tool_calls:
+                if call.name not in self.available_tools:
+                    payload = {
+                        "success": False,
+                        "error": f"Tool '{call.name}' is not in this agent's available_tools",
+                        "error_code": "permission_denied",
+                    }
+                else:
+                    tool_result = await self.tool_runtime.call(
+                        call.name,
+                        task_id=agent_input.task_context.get("task_id"),
+                        agent_id=self.id,
+                        agent_permissions=self.permissions,
+                        **call.arguments,
+                    )
+                    tool_calls_made += 1
+                    payload = tool_result.to_public_dict()
+                tool_result_blocks.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call.id,
+                        "content": json.dumps(payload),
+                        "is_error": not payload.get("success", False),
+                    }
+                )
+            messages.append(LLMMessage(role="user", content=tool_result_blocks))
+
         return AgentOutput(
-            success=True,
-            content=content,
+            success=False,
+            error=f"Agent exceeded the maximum number of tool-use rounds ({MAX_TOOL_ROUNDS})",
             tool_calls=tool_calls_made,
             tokens_used=tokens_used,
-            model=response.model,
+            model=model,
         )
 
-    def _system_prompt(self) -> str:
-        tools_note = ""
-        if self.available_tools:
-            tools_note = (
-                "\n\nIf you need external information to complete the objective, respond with "
-                "exactly one line: TOOL_CALL: <tool_name>({\"arg\": \"value\"})\n"
-                f"Available tools: {', '.join(self.available_tools)}."
-            )
-        return f"{self.system_instructions}{tools_note}"
+    def _tool_schemas(self) -> list[dict]:
+        if not self.tool_runtime or not self.available_tools:
+            return []
+        return self.tool_runtime.registry.claude_schemas(self.available_tools)
 
     def _build_prompt(self, agent_input: AgentInput) -> str:
         parts = [f"Objective: {agent_input.objective}"]

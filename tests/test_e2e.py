@@ -18,7 +18,7 @@ from orchestrator.agents.research_agent import ResearchAgent
 from orchestrator.agents.writer_agent import WriterAgent
 from orchestrator.core.orchestrator import Orchestrator
 from orchestrator.core.task_graph import TaskStatus
-from orchestrator.providers.mock_provider import MockProvider
+from orchestrator.providers.mock_provider import MockProvider, ScriptedToolUse
 from orchestrator.tools.calculator_tool import CalculatorTool
 from orchestrator.tools.registry import ToolRegistry
 from orchestrator.tools.web_search_tool import WebSearchTool
@@ -53,12 +53,13 @@ PLAN = {
 }
 
 
-def e2e_responder(system: str, messages):
+def e2e_responder(system: str, messages, tools):
     if system.startswith("You are the planning module"):
         return json.dumps(PLAN)
     if system.startswith("You are a research analyst"):
         if len(messages) == 1:
-            return 'TOOL_CALL: web_search({"query": "BI analytics competitors"})'
+            assert tools and tools[0]["name"] == "web_search", "research agent should offer web_search via Claude tool-use"
+            return ScriptedToolUse(name="web_search", arguments={"query": "BI analytics competitors"})
         return (
             "Research findings: Acme, Globex, and Initech are the primary competitors "
             "in BI analytics, each pursuing a different strategy in the market."
@@ -126,7 +127,18 @@ async def test_full_orchestration_pipeline_end_to_end():
         "ROUTER",
         "TASK",
         "AGENT",
-        "TOOL",
+        "TOOL_REQUEST",
+        "TOOL_PERMISSION",
+        "TOOL_VALIDATION",
+        "TOOL_EXECUTION",
+        "TOOL_RESULT",
         "EVALUATOR",
         "COMPLETE",
     }.issubset(tags_seen)
+
+    # context.tool_results carries a structured record of the web_search call,
+    # not just an unstructured dump.
+    tool_result_entries = [r for r in result.tool_results if r["tool"] == "web_search"]
+    assert len(tool_result_entries) == 1
+    assert tool_result_entries[0]["status"] == "success"
+    assert tool_result_entries[0]["task_id"] == "research_competitors"

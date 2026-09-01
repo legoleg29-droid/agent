@@ -120,4 +120,13 @@ class LLMAgent(BaseAgent):
             parts.append("Relevant prior task outputs:")
             for task_id, output in agent_input.upstream_outputs.items():
                 parts.append(f"- [{task_id}]: {output}")
+        if agent_input.constraints:
+            parts.append("Constraints:")
+            for constraint in agent_input.constraints:
+                parts.append(f"- {constraint}")
+        if agent_input.memory_context:
+            parts.append("Retrieved memory (for context - verify before relying on it):")
+            for entry in agent_input.memory_context:
+                content = entry.get("content")
+                parts.append(f"- ({entry.get('type')}) {content}")
         return "\n\n".join(parts)

@@ -42,6 +42,13 @@ class Task:
     result: AgentOutput | None = None
     error: str | None = None
     agent_id: str | None = None
+    started_at: float | None = None
+    completed_at: float | None = None
+
+    @property
+    def attempt(self) -> int:
+        """1-indexed attempt number, matching the persisted TaskState contract."""
+        return self.retry_count + 1
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -55,6 +62,40 @@ class Task:
             "retry_count": self.retry_count,
             "agent_id": self.agent_id,
         }
+
+    def to_full_dict(self) -> dict[str, Any]:
+        """Full round-trippable snapshot, used for state persistence/resume."""
+        d = self.to_dict()
+        d.update(
+            {
+                "max_retries": self.max_retries,
+                "started_at": self.started_at,
+                "completed_at": self.completed_at,
+                "error": self.error,
+                "result": self.result.to_dict() if self.result is not None else None,
+            }
+        )
+        return d
+
+    @classmethod
+    def from_full_dict(cls, data: dict[str, Any]) -> Task:
+        result_data = data.get("result")
+        return cls(
+            id=data["id"],
+            objective=data["objective"],
+            capability=data["capability"],
+            dependencies=list(data.get("dependencies", [])),
+            required_tools=list(data.get("required_tools", [])),
+            expected_output=data.get("expected_output", ""),
+            status=TaskStatus(data.get("status", TaskStatus.PENDING.value)),
+            retry_count=data.get("retry_count", 0),
+            max_retries=data.get("max_retries", 2),
+            result=AgentOutput.from_dict(result_data) if result_data is not None else None,
+            error=data.get("error"),
+            agent_id=data.get("agent_id"),
+            started_at=data.get("started_at"),
+            completed_at=data.get("completed_at"),
+        )
 
 
 class TaskGraph:
@@ -141,6 +182,29 @@ class TaskGraph:
 
     def failed_tasks(self) -> list[Task]:
         return [t for t in self.tasks.values() if t.status == TaskStatus.FAILED]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Full round-trippable snapshot of every task, in insertion order."""
+        return {"tasks": [t.to_full_dict() for t in self.tasks.values()]}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TaskGraph:
+        graph = cls()
+        for raw in data.get("tasks", []):
+            graph.tasks[raw["id"]] = Task.from_full_dict(raw)
+        return graph
+
+    def reset_interrupted_tasks(self) -> list[Task]:
+        """After a crash/resume, a task left RUNNING never actually finished -
+        reset it to PENDING so the scheduler picks it up again. Tasks that
+        reached SUCCEEDED/FAILED/SKIPPED before the crash are left untouched,
+        so completed work is never re-run."""
+        reset = []
+        for task in self.tasks.values():
+            if task.status == TaskStatus.RUNNING:
+                task.status = TaskStatus.PENDING
+                reset.append(task)
+        return reset
 
     def topological_order(self) -> list[Task]:
         order: list[Task] = []

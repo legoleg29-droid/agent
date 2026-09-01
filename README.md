@@ -22,12 +22,16 @@ ORCHESTRATOR        core/orchestrator.py
   |
 PLANNER             core/planner.py         - goal -> Task DAG (via LLM)
   |
-TASK GRAPH          core/task_graph.py      - DAG, dependency resolution, scheduler
+TASK GRAPH          core/task_graph.py      - DAG, dependency resolution
   |
-AGENT ROUTER        core/router.py          - capability -> agent (no hardcoding)
+SCHEDULER           core/orchestrator.py    - dependency-ordered + parallel dispatch
   |
 AGENT RUNTIME       agents/base.py + agents/*.py + agents/_common.py
   |                 (structured Claude tool-use loop)
+CONTEXT MANAGER     core/context.py + core/context_budget.py
+  |                 (budgeted: task + deps + tool results + memory + constraints)
+MEMORY / STATE      state/*, memory/*        - Runtime State + Short/Long-Term Memory
+  |
 TOOL RUNTIME        tools/runtime.py        - permission check, input/output
   |                                           validation, timeout, observability
 MCP / NATIVE TOOLS / APIS
@@ -37,12 +41,14 @@ RESULT
   |
 EVALUATOR           core/evaluator.py       - independent result judging
   |
+CHECKPOINT          state/store.py          - persist after every key transition
+  |
 REPLAN / COMPLETE   core/retry.py, core/synthesizer.py
 ```
 
 Supporting components: `Agent Registry` (`agents/registry.py`, capability-indexed
-agent lookup), `Context Manager` (`core/context.py`, global/task/agent/tool-result
-context), `State Manager` (`core/state.py`, run status and replan budget).
+agent lookup), `State Manager` (`core/state.py`, in-loop run status and replan
+budget - distinct from the persisted `ExecutionState` described below).
 
 ### Execution loop
 
@@ -81,11 +87,20 @@ executed concurrently via `asyncio.gather`.
 ### Context isolation
 
 `ContextManager` deliberately does **not** hand every agent the full run
-history. Each task only receives:
-- its own objective / expected output (task context),
-- the outputs of its *direct* dependencies (`upstream_outputs_for`), not
-  siblings' outputs or the whole graph,
-- run-level `global_context` metadata separately from task outputs.
+history, and never sends the entire memory database to Claude.
+`build_agent_context()` composes, in priority order, and then budgets:
+
+1. the current task (objective/expected output) - required, never dropped
+2. the outputs of its *direct* dependencies only - not siblings' outputs
+   or the whole graph
+3. explicit constraints - required, never dropped
+4. this task's own recent tool results
+5. retrieved memory (a small, relevance/importance-filtered slice - see
+   [State & Memory](#state--memory) below)
+6. a short execution-state progress summary
+
+See [Context budgeting](#context-budgeting) for what happens when all of
+that doesn't fit.
 
 ### Routing without hardcoding
 
@@ -95,6 +110,192 @@ agents by capability, and the `AgentRouter` looks up candidates for a
 task's required capability, preferring one that also covers the task's
 `required_tools`. Adding a new agent (see below) never requires editing
 the orchestrator.
+
+## State & Memory
+
+Runtime state and memory are kept as distinct, typed structures - never one
+generic blob - so the orchestrator can reconstruct exactly where an
+execution is without replaying conversation history.
+
+```
+Runtime State (orchestrator/state/)          Memory (orchestrator/memory/)
+├── Execution State   - ExecutionState        ├── Short-Term Memory  - this execution only
+├── Task State        - TaskState             └── Long-Term Memory   - pluggable backend
+├── Agent State       - AgentState                 ├── InMemoryLongTermMemory (tests)
+├── Tool State        - ToolState                  ├── SQLiteLongTermMemory (default)
+└── Context           - core/context.py            └── (future) VectorStoreLongTermMemory
+```
+
+### Execution State (`orchestrator/state/models.py`)
+
+`ExecutionState` is the single persisted record of one run: `execution_id`,
+`user_goal`, `status`, `current_plan` (a `TaskGraph` snapshot),
+`active_task`, `completed_tasks`, `failed_tasks`, `task_states`, `context`,
+`artifacts`, `created_at`/`updated_at`, `metadata`. `status` is one of
+`pending`, `planning`, `running`, `paused`, `waiting`, `completed`,
+`failed`, `cancelled` (`ExecutionStatus`).
+
+### Task State
+
+Every task has a persistent `TaskState` (`task_id`, `status`, `attempt`,
+`agent_id`, `started_at`, `completed_at`, `result`, `error`), kept in sync
+with the live `Task` on every transition via `ExecutionState.sync_task_state()`
+and checkpointed - it survives individual agent calls and process restarts,
+not just the current Python object.
+
+### Agent State
+
+`AgentState` (current objective, reasoning context, active tool call,
+intermediate result, metadata) is created fresh for each
+`(execution_id, task_id, agent_id)` call in `Orchestrator._run_task` and
+discarded when it returns - there is no module-level or otherwise shared
+mutable agent state anywhere in this codebase, so it cannot leak between
+tasks, agents, executions, or users (`tests/test_agent_state_isolation.py`).
+
+### Short-Term Memory (`orchestrator/memory/short_term.py`)
+
+An execution-scoped, size-bounded buffer of structured `MemoryEntry`
+records (recent task/tool results, decisions, constraints) - never raw
+conversation history, and never accepts an entry scoped to a different
+execution. When full, it evicts the oldest *low-importance* entries first,
+not just the oldest.
+
+### Long-Term Memory (`orchestrator/memory/long_term.py`)
+
+```python
+class LongTermMemory(ABC):
+    def store(self, entry: MemoryEntry) -> None: ...
+    def search(self, query: MemoryQuery) -> list[MemoryEntry]: ...
+    def get(self, memory_id: str) -> MemoryEntry | None: ...
+    def delete(self, memory_id: str) -> None: ...
+```
+
+`InMemoryLongTermMemory` (tests/ephemeral runs) and `SQLiteLongTermMemory`
+(the default local-development backend, `orchestrator_state.db`) both
+implement this; a future vector store only needs to implement the same
+four methods (with an embedding index behind `search`) - the orchestrator
+never depends on a concrete backend.
+
+**Explicit memory types** (`MemoryType`): `fact`, `decision`, `preference`,
+`task_result`, `tool_result`, `summary`, `artifact`, `error`,
+`observation` - nothing is stored as plain, untyped text.
+
+### Memory Policy (`orchestrator/memory/policy.py`)
+
+Nothing is stored automatically. After a task the `Evaluator` judged
+successful, its result is *offered* to `MemoryManager.store()`, which runs
+`MemoryPolicy.evaluate()` to decide:
+
+- **should it be stored at all** - importance below threshold (default
+  `0.4`) stays in short-term memory only, never reaches the long-term
+  store;
+- **importance** - explicit hint, or a per-`MemoryType` default (a
+  `decision` defaults higher than a `tool_result`);
+- **scope** - `execution` by default; `decision` defaults to `project`
+  scope and `preference` to `user` scope, matching the spec's example
+  (a temporary tool output stays execution-scoped, an important decision
+  graduates to project scope);
+- **never store a credential** - content that looks like it contains a
+  secret (`sk-...`, `Bearer ...`, an AWS key shape, a PEM private key
+  block, or a dict with a key like `api_key`/`password`/`token`) is
+  refused outright, not merely redacted - it isn't even kept in
+  short-term memory.
+
+### Memory scopes and isolation
+
+`MemoryScope`: `execution`, `session`, `project`, `user`. Every
+`LongTermMemory.search()` call **requires** at least one of
+`execution_id`/`session_id`/`project_id`/`user_id` on the `MemoryQuery` -
+an unscoped search raises `ScopeViolationError` rather than silently
+returning everything, so one execution's/user's memory can never leak into
+another's context by accident (`tests/test_long_term_memory.py`,
+`tests/test_agent_state_isolation.py`).
+
+### Context budgeting
+
+`ContextBudget` (`orchestrator/core/context_budget.py`) assembles context
+sections in priority order up to a token budget (`~4 chars/token`
+estimate, `context_max_tokens` on `Orchestrator`, default `3000`):
+current task (required) → dependencies/constraints → recent tool results →
+memory → execution-state summary. A section that doesn't fully fit is
+**summarized** (truncated with an explicit "N tokens omitted" note) before
+being dropped; only a section that can't fit even a minimal summary is
+omitted, and every omission is recorded (`BudgetedContext.omitted`/
+`.truncated`) rather than silently lost.
+
+### Persistence and checkpointing (`orchestrator/state/store.py`)
+
+```
+START -> SAVE STATE -> EXECUTE -> SAVE STATE -> CRASH/STOP -> RESTART -> RESUME
+```
+
+```python
+class StateStore(ABC):
+    def save(self, state: ExecutionState) -> None: ...
+    def load(self, execution_id: str) -> ExecutionState | None: ...
+    def list_executions(self) -> list[str]: ...
+    def delete(self, execution_id: str) -> None: ...
+```
+
+`InMemoryStateStore` (tests, the `Orchestrator` default) and
+`SQLiteStateStore` (`orchestrator_state.db` by default, what `main.py`
+uses) both implement it. Every `save()` runs inside a SQLite transaction
+(`BEGIN IMMEDIATE`), so a crash mid-write can never leave a half-written
+execution on disk - the "if persistence supports transactions, use them"
+concurrency requirement. The orchestrator checkpoints (persists + emits a
+`CHECKPOINT` event) at every required transition: plan creation, task
+start, task completion, task failure, replan, and execution completion -
+and always refreshes the persisted plan snapshot from the live `TaskGraph`
+first, so a resume never sees a stale "everything still pending" plan.
+
+### Resume
+
+```python
+result = await orchestrator.resume_execution(execution_id)
+```
+
+Loads the persisted `ExecutionState`, reconstructs the `TaskGraph` from its
+checkpointed plan snapshot, resets any task that was still `RUNNING` when
+the process stopped back to `PENDING` (it never got to report success or
+failure, so it's retried - not left stuck), rehydrates prior successful
+task outputs into the live `ContextManager` so downstream tasks still see
+them, and continues the same execute loop used by `run()` - **without**
+re-invoking the planner or re-running any task that already succeeded,
+failed terminally, or was skipped. See
+`tests/test_checkpoint_resume.py` and
+`tests/test_phase3_e2e.py::test_interrupted_after_research_task_resumes_without_rerunning_it`
+for a full crash-and-resume simulation.
+
+### Artifacts
+
+Generated files (e.g. a successful `file_write`) are tracked as
+`Artifact(artifact_id, type, path, task_id, agent_id, created_at,
+metadata)` - a reference only. Large file content is never put inside
+memory or state; only the path and metadata are stored, on
+`ExecutionState.artifacts`/`ExecutionState.metadata["artifacts_detail"]`.
+
+### Sensitive-data filtering (`orchestrator/security/redaction.py`)
+
+Shared by both persistence paths:
+- `redact_sensitive(value)` - recursively scrubs an `ExecutionState`/
+  `MemoryEntry` dict before every `StateStore.save()`/`LongTermMemory.store()`
+  call: any key that looks like `api_key`/`password`/`token`/`secret`/
+  `credential`/etc. is replaced with `<redacted>`, and string values are
+  additionally scanned for secret-*shaped* substrings (an `sk-...` token, a
+  `Bearer ...` header, an AWS access key, a PEM private key block) even
+  under an innocuous key name.
+- `contains_sensitive_value(value)` - the stronger check `MemoryPolicy`
+  uses to refuse creating a memory entry **at all**, per the spec: a
+  sensitive credential is never stored in memory, not even redacted.
+- Observability never logs memory *content* - `MEMORY_STORED`/
+  `MEMORY_SKIPPED`/`MEMORY_RETRIEVED` events carry type/source/scope/reason,
+  never the entry's `content`.
+
+### Observability tags (state/memory)
+
+`STATE_CREATED`, `STATE_UPDATED`, `TASK_STATE_CHANGED`, `MEMORY_STORED`,
+`MEMORY_RETRIEVED`, `MEMORY_SKIPPED`, `CHECKPOINT`, `RESUME` - alongside
+the Phase 1/2 tags listed under [Observability](#observability).
 
 ## Installation
 
@@ -116,6 +317,8 @@ cp .env.example .env                   # then fill in ANTHROPIC_API_KEY
 | `ORCHESTRATOR_MAX_REPLANS` | No | `2` | Per-run re-plan budget |
 | `ORCHESTRATOR_SANDBOX_DIR` | No | `./sandbox` | Root directory for `file_read`/`file_write`/`list_files` - no path can escape it |
 | `ORCHESTRATOR_TOOL_TIMEOUT_SECONDS` | No | `30` | Default per-tool execution timeout |
+| `ORCHESTRATOR_STATE_DB` | No | `./orchestrator_state.db` | SQLite file for execution-state checkpoints + long-term memory |
+| `ORCHESTRATOR_MOCK_STATE_DB` | No | `./orchestrator_state.mock.db` | Separate db for `--mock` runs so they never collide with real ones |
 
 No secrets are hardcoded anywhere in the codebase; `ClaudeProvider` reads
 `ANTHROPIC_API_KEY` from the environment and raises immediately if it's
@@ -188,6 +391,22 @@ An agent can never read or write outside the sandbox: a path like
 safely reinterpreted as relative to the sandbox root - see
 [Filesystem security](#filesystem-security) below.
 
+### Resuming an interrupted execution
+
+Every run is checkpointed to SQLite (`ORCHESTRATOR_STATE_DB`), so a killed
+or crashed process can be resumed without re-running completed tasks:
+
+```bash
+python main.py --mock "Research three competitors and summarize the findings."
+# -> prints an execution id, e.g. exec_a1b2c3d4e5f6, and checkpoints after
+#    every task
+
+python main.py --mock --resume exec_a1b2c3d4e5f6
+# -> loads the persisted plan/task state; any task already SUCCEEDED is
+#    never re-executed, a task that was RUNNING when the process stopped
+#    is retried, and execution continues to completion
+```
+
 ### Programmatic usage
 
 ```python
@@ -225,9 +444,12 @@ asyncio.run(main())
 
 Every lifecycle event is emitted through `EventLog` (`orchestrator/core/logging_utils.py`)
 with one of these tags: `ORCHESTRATOR`, `PLANNER`, `ROUTER`, `TASK`, `AGENT`,
-`EVALUATOR`, `RETRY`, `REPLAN`, `COMPLETE`, and the tool lifecycle tags
+`EVALUATOR`, `RETRY`, `REPLAN`, `COMPLETE`; the tool lifecycle tags
 `TOOL_REQUEST`, `TOOL_VALIDATION`, `TOOL_PERMISSION`, `TOOL_EXECUTION`,
-`TOOL_RESULT`, `TOOL_ERROR`. Each event is both printed as
+`TOOL_RESULT`, `TOOL_ERROR`; and the state/memory tags `STATE_CREATED`,
+`STATE_UPDATED`, `TASK_STATE_CHANGED`, `MEMORY_STORED`, `MEMORY_RETRIEVED`,
+`MEMORY_SKIPPED`, `CHECKPOINT`, `RESUME` (see [State & Memory](#state--memory)).
+Each event is both printed as
 `[TAG] message (field=value, ...)` and stored as a structured dict
 (`OrchestrationResult.events`) carrying task id, agent id, tool id, status,
 duration, retry count, tokens used, model, and tool call count where
@@ -531,7 +753,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The suite (93 tests, all offline/deterministic via `MockProvider` and
+The suite (170 tests, all offline/deterministic via `MockProvider` and
 in-process test doubles) covers:
 
 - Planner (plan generation, validation, rejection of bad output, replanning)
@@ -559,6 +781,32 @@ in-process test doubles) covers:
   "research -> analyze -> strategize" example, using the real `ResearchAgent`,
   `AnalysisAgent`, `WriterAgent` and real tools - including a native Claude
   tool-use round - against a scripted provider)
+- Execution state creation, transitions, and round-trip serialization -
+  `tests/test_state_models.py`
+- State persistence, checkpointing, and sensitive-data redaction before
+  save (both `InMemoryStateStore` and `SQLiteStateStore`) - `tests/test_state_store.py`
+- Short-term memory (recency/importance eviction, execution-scope
+  enforcement) - `tests/test_short_term_memory.py`
+- Long-term memory (store/search/get/delete, required scope filter,
+  cross-execution and cross-user isolation, both backends) - `tests/test_long_term_memory.py`
+- Memory policy and filtering (importance thresholds, default
+  scope-per-type, sensitive content refused outright, never logged) -
+  `tests/test_memory_policy.py`
+- Context construction, prioritization, and budgeting (required sections
+  never dropped, graceful summarize-before-omit degradation, bounded
+  memory retrieval) - `tests/test_context_budget.py`
+- Agent state isolation - fresh per (execution, task, agent) call, no
+  shared mutable defaults, cross-execution isolation of persisted state -
+  `tests/test_agent_state_isolation.py`
+- Checkpointing and resume, including a genuine crash simulation (an
+  exception that escapes `run()` entirely) proving a completed task is
+  never re-executed after `resume_execution()` - `tests/test_checkpoint_resume.py`
+- Full Phase 3 end-to-end scenario - "Research three competitors and
+  summarize the findings" with real agents: execution created, plan
+  created, task state persisted, results stored, memory created,
+  checkpointed at every required transition, final result generated,
+  execution marked completed; then interrupted after the research task and
+  resumed without re-running it - `tests/test_phase3_e2e.py`
 
 ## Repository layout
 
@@ -575,8 +823,15 @@ orchestrator/
                register_mcp_server)
   providers/   LLMProvider, ClaudeProvider (native tool-use), MockProvider
                (ScriptedToolUse for offline tool-loop testing)
+  state/       ExecutionState, TaskState, AgentState, ToolState, Artifact,
+               ExecutionStatus; StateStore (InMemory/SQLite), checkpointing
+  memory/      MemoryEntry/MemoryType/MemoryScope/MemoryQuery,
+               ShortTermMemory, LongTermMemory (InMemory/SQLite),
+               MemoryPolicy, MemoryManager facade
+  security/    redact_sensitive / contains_sensitive_value - shared
+               sensitive-data filtering for state + memory persistence
 tests/         pytest suite (see above)
-main.py        CLI entry point
+main.py        CLI entry point (supports --resume EXECUTION_ID)
 .env.example   environment variable template
 ```
 
@@ -606,3 +861,22 @@ main.py        CLI entry point
 - No shell/arbitrary command execution tool exists by design (per the
   Phase 2 spec); adding one would need its own sandboxing story beyond
   what `FileSandbox` provides.
+- `SQLiteStateStore`/`SQLiteLongTermMemory` use a per-instance lock plus a
+  SQLite transaction per write, which serializes writes within one
+  process/`Orchestrator` correctly but does not add cross-process/
+  cross-machine locking - fine for local development and a single running
+  orchestrator process, not a multi-writer production deployment.
+  `LongTermMemory`/`StateStore` are both swappable, so a Postgres-backed
+  implementation with real row locking is a drop-in replacement.
+- Memory extraction is currently triggered only after a task the
+  `Evaluator` judged `SUCCESS`, and only as `MemoryType.TASK_RESULT`; an
+  agent doesn't yet have a way to explicitly emit a `decision`/`preference`/
+  `fact` memory mid-task - `MemoryManager.store()` supports it, but nothing
+  in `LLMAgent` calls it yet.
+- Context budgeting uses a simple `~4 chars/token` estimate, not an actual
+  tokenizer - close enough to prioritize/trim by, not exact.
+- `resume_execution()` does not distinguish "nothing to do, already
+  completed" from "genuinely resuming" beyond what the `CHECKPOINT`/
+  `RESUME` events show - calling it on an already-completed execution is
+  safe (no task re-runs) but re-synthesizes the final result and
+  checkpoints again rather than short-circuiting immediately.

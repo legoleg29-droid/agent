@@ -31,6 +31,15 @@ VALID_TAGS = {
     "TOOL_EXECUTION",
     "TOOL_RESULT",
     "TOOL_ERROR",
+    # State/memory lifecycle (Phase 3).
+    "STATE_CREATED",
+    "STATE_UPDATED",
+    "TASK_STATE_CHANGED",
+    "MEMORY_STORED",
+    "MEMORY_RETRIEVED",
+    "MEMORY_SKIPPED",
+    "CHECKPOINT",
+    "RESUME",
 }
 
 _logger = logging.getLogger("orchestrator")

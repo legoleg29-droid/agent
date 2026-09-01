@@ -31,3 +31,9 @@ __pycache__/
 venv/
 *.egg-info/
 .env
+
+### Orchestrator runtime data ###
+orchestrator_state*.db
+orchestrator_state*.db-wal
+orchestrator_state*.db-shm
+sandbox/

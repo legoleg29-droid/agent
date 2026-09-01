@@ -24,6 +24,8 @@ class AgentInput:
     expected_output: str = ""
     task_context: dict[str, Any] = field(default_factory=dict)
     upstream_outputs: dict[str, Any] = field(default_factory=dict)
+    memory_context: list[dict[str, Any]] = field(default_factory=list)
+    constraints: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -35,6 +37,29 @@ class AgentOutput:
     tool_calls: int = 0
     tokens_used: int = 0
     model: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "success": self.success,
+            "content": self.content,
+            "data": self.data,
+            "error": self.error,
+            "tool_calls": self.tool_calls,
+            "tokens_used": self.tokens_used,
+            "model": self.model,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AgentOutput:
+        return cls(
+            success=data["success"],
+            content=data.get("content", ""),
+            data=data.get("data", {}) or {},
+            error=data.get("error"),
+            tool_calls=data.get("tool_calls", 0),
+            tokens_used=data.get("tokens_used", 0),
+            model=data.get("model"),
+        )
 
 
 class BaseAgent(ABC):

@@ -29,6 +29,8 @@ from orchestrator.agents.writer_agent import WriterAgent
 from orchestrator.core.orchestrator import Orchestrator
 from orchestrator.providers.base import LLMMessage, LLMProvider
 from orchestrator.providers.mock_provider import ScriptedToolUse
+from orchestrator.memory.long_term import SQLiteLongTermMemory
+from orchestrator.state.store import SQLiteStateStore
 from orchestrator.tools.calculator_tool import CalculatorTool
 from orchestrator.tools.file_tools import FileReadTool, FileWriteTool, ListFilesTool
 from orchestrator.tools.registry import ToolRegistry
@@ -216,7 +218,7 @@ def build_provider(use_mock: bool) -> LLMProvider:
     return ClaudeProvider()
 
 
-def build_orchestrator(provider: LLMProvider) -> Orchestrator:
+def build_orchestrator(provider: LLMProvider, *, use_mock: bool) -> Orchestrator:
     sandbox_dir = os.environ.get("ORCHESTRATOR_SANDBOX_DIR", "./sandbox")
     sandbox = FileSandbox(sandbox_dir)
     tool_timeout = float(os.environ.get("ORCHESTRATOR_TOOL_TIMEOUT_SECONDS", 30))
@@ -228,6 +230,15 @@ def build_orchestrator(provider: LLMProvider) -> Orchestrator:
     tool_registry.register(FileWriteTool(sandbox))
     tool_registry.register(ListFilesTool(sandbox))
 
+    # State/memory persistence: SQLite by default so `--resume` works across
+    # process restarts. --mock runs get their own db file so demo runs never
+    # collide with real ones.
+    db_path = os.environ.get("ORCHESTRATOR_STATE_DB", "./orchestrator_state.db")
+    if use_mock:
+        db_path = os.environ.get("ORCHESTRATOR_MOCK_STATE_DB", "./orchestrator_state.mock.db")
+    state_store = SQLiteStateStore(db_path)
+    long_term_memory = SQLiteLongTermMemory(db_path)
+
     agent_registry = AgentRegistry()
     orchestrator = Orchestrator(
         provider,
@@ -235,8 +246,11 @@ def build_orchestrator(provider: LLMProvider) -> Orchestrator:
         tool_registry,
         max_retries_per_task=int(os.environ.get("ORCHESTRATOR_MAX_RETRIES_PER_TASK", 2)),
         max_replans=int(os.environ.get("ORCHESTRATOR_MAX_REPLANS", 2)),
+        state_store=state_store,
+        long_term_memory=long_term_memory,
     )
     orchestrator.tool_runtime.default_timeout_seconds = tool_timeout
+    print(f"[main] Persisting execution state + memory to: {db_path}", file=sys.stderr)
 
     # Agents share the orchestrator's tool runtime so tool calls are logged
     # to the same observability stream as everything else, and so their
@@ -250,11 +264,12 @@ def build_orchestrator(provider: LLMProvider) -> Orchestrator:
     return orchestrator
 
 
-async def main_async(goal: str, use_mock: bool) -> int:
-    provider = build_provider(use_mock)
-    orchestrator = build_orchestrator(provider)
-
-    result = await orchestrator.run(goal)
+def _print_result(result) -> None:
+    print("\n" + "=" * 72)
+    print("EXECUTION")
+    print("=" * 72)
+    print(f"  id={result.execution_id}  status={result.execution_state.status.value}")
+    print(f"  (resume with: python main.py --resume {result.execution_id})")
 
     print("\n" + "=" * 72)
     print("TASK GRAPH")
@@ -269,25 +284,50 @@ async def main_async(goal: str, use_mock: bool) -> int:
         for entry in result.tool_results:
             print(f"  [{entry['status'].upper():7}] {entry['tool']} (task={entry['task_id']})")
 
+    if result.execution_state.artifacts:
+        print("\n" + "=" * 72)
+        print("ARTIFACTS")
+        print("=" * 72)
+        for detail in result.execution_state.metadata.get("artifacts_detail", []):
+            print(f"  [{detail['type']}] {detail['path']} (task={detail['task_id']})")
+
     print("\n" + "=" * 72)
     print("FINAL RESULT")
     print("=" * 72)
     print(result.final_output)
     print()
 
+
+async def main_async(goal: str | None, use_mock: bool, resume_id: str | None) -> int:
+    provider = build_provider(use_mock)
+    orchestrator = build_orchestrator(provider, use_mock=use_mock)
+
+    if resume_id:
+        print(f"[main] Resuming execution '{resume_id}'...", file=sys.stderr)
+        result = await orchestrator.resume_execution(resume_id)
+    else:
+        result = await orchestrator.run(goal)
+
+    _print_result(result)
     return 0 if result.succeeded else 1
 
 
 def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(description="AI Agent Orchestrator")
-    parser.add_argument("goal", help="High-level goal for the orchestrator to accomplish")
+    parser.add_argument("goal", nargs="?", help="High-level goal for the orchestrator to accomplish")
     parser.add_argument(
         "--mock", action="store_true", help="Run offline with a deterministic MockProvider instead of Claude"
     )
+    parser.add_argument(
+        "--resume", metavar="EXECUTION_ID", help="Resume a previously interrupted execution instead of starting a new one"
+    )
     args = parser.parse_args()
 
-    exit_code = asyncio.run(main_async(args.goal, args.mock))
+    if not args.goal and not args.resume:
+        parser.error("a goal is required unless --resume is given")
+
+    exit_code = asyncio.run(main_async(args.goal, args.mock, args.resume))
     sys.exit(exit_code)
 
 

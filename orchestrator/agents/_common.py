@@ -113,6 +113,8 @@ class LLMAgent(BaseAgent):
         return self.tool_runtime.registry.claude_schemas(self.available_tools)
 
     def _build_prompt(self, agent_input: AgentInput) -> str:
+        if agent_input.repair_feedback:
+            return self._build_repair_prompt(agent_input)
         parts = [f"Objective: {agent_input.objective}"]
         if agent_input.expected_output:
             parts.append(f"Expected output: {agent_input.expected_output}")
@@ -129,4 +131,30 @@ class LLMAgent(BaseAgent):
             for entry in agent_input.memory_context:
                 content = entry.get("content")
                 parts.append(f"- ({entry.get('type')}) {content}")
+        return "\n\n".join(parts)
+
+    def _build_repair_prompt(self, agent_input: AgentInput) -> str:
+        """A focused repair prompt: what needs fixing, not a fresh brief.
+        The agent gets its own previous output back and is told exactly
+        which acceptance criteria it failed, so it can target the fix
+        instead of redoing everything from scratch."""
+        fb = agent_input.repair_feedback or {}
+        parts = [
+            f"Objective (unchanged): {agent_input.objective}",
+            f"REPAIR REQUEST (attempt {fb.get('attempt', 1)}): your previous attempt at this "
+            "objective did not satisfy all acceptance criteria. Fix ONLY what's identified "
+            "below - do not discard work that already satisfies other criteria.",
+        ]
+        if fb.get("failed_criteria"):
+            parts.append("Failed criteria:\n" + "\n".join(f"- {c}" for c in fb["failed_criteria"]))
+        if fb.get("reasons"):
+            parts.append("Evaluator reasons:\n" + "\n".join(f"- {r}" for r in fb["reasons"]))
+        if fb.get("evidence"):
+            parts.append("Evaluator evidence:\n" + "\n".join(f"- {e}" for e in fb["evidence"]))
+        if fb.get("previous_output"):
+            parts.append(f"Your previous output was:\n{fb['previous_output']}")
+        if agent_input.upstream_outputs:
+            parts.append("Relevant prior task outputs:")
+            for task_id, output in agent_input.upstream_outputs.items():
+                parts.append(f"- [{task_id}]: {output}")
         return "\n\n".join(parts)

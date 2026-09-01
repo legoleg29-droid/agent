@@ -19,6 +19,7 @@ COMPUTE = "compute"
 DATABASE_READ = "database.read"
 DATABASE_WRITE = "database.write"
 DATABASE_DELETE = "database.delete"
+CODE_EXECUTION = "code_execution"
 
 
 def missing_permissions(required: list[str], granted: list[str]) -> list[str]:

@@ -54,6 +54,18 @@ VALID_TAGS = {
     "TASK_CANCELLED",
     "EXECUTION_PAUSED",
     "EXECUTION_RESUMED",
+    # Evaluation / self-repair / replanning lifecycle (Phase 5).
+    "EVALUATION_STARTED",
+    "EVALUATION_COMPLETED",
+    "EVALUATION_FAILED",
+    "REPAIR_STARTED",
+    "REPAIR_COMPLETED",
+    "REPAIR_FAILED",
+    "REPLAN_STARTED",
+    "REPLAN_COMPLETED",
+    "TASK_INVALIDATED",
+    "PLAN_VERSION_CREATED",
+    "LOOP_LIMIT_REACHED",
 }
 
 _logger = logging.getLogger("orchestrator")

@@ -26,6 +26,7 @@ class TaskStatus(str, Enum):
     BLOCKED = "blocked"         # a dependency permanently failed - this task can never run as planned
     CANCELLED = "cancelled"     # execution was cancelled before this task ran
     SKIPPED = "skipped"         # legacy: cascaded during a full-graph abort (see mark_unreachable_as_skipped)
+    INVALIDATED = "invalidated"  # was SUCCEEDED, but its result is no longer trusted - not terminal, may be re-run
 
 
 # Statuses that mean "this task will never run/change again".
@@ -55,11 +56,25 @@ class Task:
     started_at: float | None = None
     completed_at: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Phase 5: explicit acceptance criteria (free-text and/or structured dict
+    # checks - see orchestrator/core/evaluation_models.py), and repair
+    # tracking distinct from retry_count.
+    acceptance_criteria: list[Any] = field(default_factory=list)
+    repair_count: int = 0
+    max_repairs: int = 2
+    # Latest evaluation feedback, in task state per the spec's example
+    # (task.evaluation = {"status": ..., "failed_criteria": [...], ...}).
+    # Full history lives on ExecutionState.evaluation_history.
+    evaluation: dict[str, Any] | None = None
 
     @property
     def attempt(self) -> int:
         """1-indexed attempt number, matching the persisted TaskState contract."""
         return self.retry_count + 1
+
+    @property
+    def repair_attempt(self) -> int:
+        return self.repair_count + 1
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -85,6 +100,10 @@ class Task:
                 "error": self.error,
                 "result": self.result.to_dict() if self.result is not None else None,
                 "metadata": self.metadata,
+                "acceptance_criteria": self.acceptance_criteria,
+                "repair_count": self.repair_count,
+                "max_repairs": self.max_repairs,
+                "evaluation": self.evaluation,
             }
         )
         return d
@@ -108,6 +127,10 @@ class Task:
             started_at=data.get("started_at"),
             completed_at=data.get("completed_at"),
             metadata=data.get("metadata", {}) or {},
+            acceptance_criteria=list(data.get("acceptance_criteria", []) or []),
+            repair_count=data.get("repair_count", 0),
+            max_repairs=data.get("max_repairs", 2),
+            evaluation=data.get("evaluation"),
         )
 
 
@@ -156,6 +179,13 @@ class TaskGraph:
         if cycle:
             task.dependencies.remove(dependency_id)
             raise CycleError(f"Adding dependency '{task_id}' -> '{dependency_id}' would create a cycle: {' -> '.join(cycle)}")
+
+    def remove_dependency(self, task_id: str, dependency_id: str) -> None:
+        task = self.tasks.get(task_id)
+        if task is None:
+            raise ValueError(f"Unknown task '{task_id}'")
+        if dependency_id in task.dependencies:
+            task.dependencies.remove(dependency_id)
 
     def get_task(self, task_id: str) -> Task | None:
         return self.tasks.get(task_id)
@@ -291,6 +321,37 @@ class TaskGraph:
                     changed = True
         return blocked
 
+    def invalidate_task(self, task_id: str, *, reason: str) -> Task:
+        """A previously-SUCCEEDED task's result is no longer trusted (its
+        dependency assumptions changed, its artifact was deleted, the
+        planner explicitly invalidates it, ...). Only this one task is
+        touched - dependents are NOT automatically invalidated; call this
+        explicitly for each task that genuinely needs to be re-verified."""
+        task = self.tasks.get(task_id)
+        if task is None:
+            raise ValueError(f"Unknown task '{task_id}'")
+        if task.status != TaskStatus.SUCCEEDED:
+            raise ValueError(f"Only a SUCCEEDED task can be invalidated (task '{task_id}' is {task.status.value})")
+        task.status = TaskStatus.INVALIDATED
+        task.metadata["invalidation_reason"] = reason
+        return task
+
+    def reactivate_invalidated_tasks(self) -> list[Task]:
+        """Reset INVALIDATED tasks back to PENDING (clearing their stale
+        result) so the scheduler picks them up for re-execution."""
+        reactivated = []
+        for task in self.tasks.values():
+            if task.status == TaskStatus.INVALIDATED:
+                task.status = TaskStatus.PENDING
+                task.result = None
+                task.error = None
+                task.completed_at = None
+                reactivated.append(task)
+        return reactivated
+
+    def invalidated_tasks(self) -> list[Task]:
+        return [t for t in self.tasks.values() if t.status == TaskStatus.INVALIDATED]
+
     def mark_remaining_as_cancelled(self) -> list[Task]:
         """Used by execution cancellation: every task not already in a
         terminal state is marked CANCELLED (never marked as completed)."""
@@ -306,7 +367,15 @@ class TaskGraph:
 
     def has_pending_work(self) -> bool:
         return any(
-            t.status in (TaskStatus.PENDING, TaskStatus.READY, TaskStatus.RUNNING, TaskStatus.RETRYING, TaskStatus.WAITING)
+            t.status
+            in (
+                TaskStatus.PENDING,
+                TaskStatus.READY,
+                TaskStatus.RUNNING,
+                TaskStatus.RETRYING,
+                TaskStatus.WAITING,
+                TaskStatus.INVALIDATED,
+            )
             for t in self.tasks.values()
         )
 
@@ -314,7 +383,14 @@ class TaskGraph:
         return [t for t in self.tasks.values() if t.status == TaskStatus.SUCCEEDED]
 
     def failed_tasks(self) -> list[Task]:
-        return [t for t in self.tasks.values() if t.status == TaskStatus.FAILED]
+        """FAILED tasks that are still the execution's problem. A FAILED
+        task a replan has superseded (metadata["superseded_by"] - see
+        plan_patch.REPLACE_TASK) is excluded: it's part of the run's
+        history, not a reason the overall execution should read as
+        failed once its replacement has succeeded."""
+        return [
+            t for t in self.tasks.values() if t.status == TaskStatus.FAILED and "superseded_by" not in t.metadata
+        ]
 
     def blocked_tasks(self) -> list[Task]:
         return [t for t in self.tasks.values() if t.status == TaskStatus.BLOCKED]

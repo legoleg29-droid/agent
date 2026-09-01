@@ -24,9 +24,14 @@ from dataclasses import dataclass, field
 from orchestrator.agents.base import AgentInput, AgentOutput, BaseAgent
 from orchestrator.agents.registry import AgentRegistry
 from orchestrator.core.context import ContextManager
-from orchestrator.core.evaluator import Evaluator, Verdict
+from orchestrator.core.evaluation_models import EvaluationContext, EvaluationResult, EvaluationStatus
+from orchestrator.core.evaluation_policy import EvaluationPolicy
+from orchestrator.core.evaluator import Evaluator
 from orchestrator.core.logging_utils import EventLog
+from orchestrator.core.plan_patch import apply_plan_patch
+from orchestrator.core.plan_version import PlanVersion
 from orchestrator.core.planner import Planner
+from orchestrator.core.repair import RepairManager
 from orchestrator.core.retry import Action, RetryPolicy
 from orchestrator.core.router import AgentRouter
 from orchestrator.core.scheduler import DAGScheduler, ResourceLimits, SchedulerResult
@@ -42,8 +47,13 @@ from orchestrator.state.models import Artifact, ExecutionState, ExecutionStatus,
 from orchestrator.state.store import ExecutionNotFoundError, InMemoryStateStore, StateStore
 from orchestrator.tools.registry import ToolRegistry
 from orchestrator.tools.runtime import ToolRuntime
+from orchestrator.tools.sandbox import FileSandbox
 
 DEFAULT_CONTEXT_MAX_TOKENS = 3000
+
+# Same failure signature recurring this many times during one execution
+# means replanning isn't converging - stop instead of oscillating forever.
+MAX_REPEATED_FAILURE_SIGNATURE = 2
 
 
 @dataclass
@@ -66,6 +76,7 @@ class Orchestrator:
         tool_registry: ToolRegistry | None = None,
         *,
         max_retries_per_task: int = 2,
+        max_repairs_per_task: int = 2,
         max_replans: int = 2,
         verbose_logging: bool = True,
         state_store: StateStore | None = None,
@@ -79,11 +90,14 @@ class Orchestrator:
         max_execution_time_seconds: float | None = None,
         retry_backoff_base_seconds: float = 0.5,
         max_retry_backoff_seconds: float = 10.0,
+        sandbox: FileSandbox | None = None,
+        evaluation_policy: EvaluationPolicy | None = None,
     ) -> None:
         self.provider = provider
         self.agent_registry = agent_registry
         self.tool_registry = tool_registry or ToolRegistry()
         self.max_retries_per_task = max_retries_per_task
+        self.max_repairs_per_task = max_repairs_per_task
         self.max_replans = max_replans
         self.context_max_tokens = context_max_tokens
         self.max_concurrent_tasks = max_concurrent_tasks
@@ -95,9 +109,17 @@ class Orchestrator:
         self.tool_runtime = ToolRuntime(self.tool_registry, self.event_log)
         self.planner = Planner(provider, self.event_log)
         self.router = AgentRouter(agent_registry, self.event_log)
-        self.evaluator = Evaluator()
+        self.evaluator = Evaluator(provider=provider, policy=evaluation_policy, sandbox=sandbox)
         self.retry_policy = RetryPolicy()
+        self.repair_manager = RepairManager()
         self.synthesizer = FinalResultSynthesizer(provider, self.event_log)
+
+        # Last computed EvaluationResult per task id, for as long as this
+        # attempt is in flight - the scheduler's on_replan_needed hook only
+        # gets the failed Task back, not the evaluation that triggered the
+        # replan, so this closes that gap without threading one more
+        # parameter through the scheduler's generic TaskExecutor contract.
+        self._last_evaluations: dict[str, EvaluationResult] = {}
 
         # Persistence: pluggable, local-development-friendly defaults.
         self.state_store: StateStore = state_store or InMemoryStateStore()
@@ -118,6 +140,10 @@ class Orchestrator:
         # actually executing right now (from another coroutine/task), not
         # just a persisted-but-not-live one.
         self._active_schedulers: dict[str, DAGScheduler] = {}
+
+        # Current PlanVersion per execution_id, so replanning can link a new
+        # version back to its parent - see plan_version.py.
+        self._plan_versions: dict[str, PlanVersion] = {}
 
     # -- Public entry points ---------------------------------------------
 
@@ -145,7 +171,17 @@ class Orchestrator:
         graph = await self.planner.plan(goal, capabilities=capabilities, tools=tools)
         for task in graph.tasks.values():
             task.max_retries = self.max_retries_per_task
+            task.max_repairs = self.max_repairs_per_task
         execution_state.current_plan = graph.to_dict()
+
+        initial_version = PlanVersion.initial(graph.to_dict(), change_reason="initial plan")
+        self._plan_versions[execution_state.execution_id] = initial_version
+        execution_state.record_plan_version(initial_version.to_dict())
+        self.event_log.emit(
+            "PLAN_VERSION_CREATED",
+            f"Plan version {initial_version.version} created for '{execution_state.execution_id}'",
+            extra={"execution_id": execution_state.execution_id, "plan_id": initial_version.plan_id, "version": initial_version.version},
+        )
         self.state_store.checkpoint(execution_state, self.event_log, "plan created")
 
         execution_state.set_status(ExecutionStatus.RUNNING)
@@ -169,6 +205,13 @@ class Orchestrator:
 
         graph = TaskGraph.from_dict(state.current_plan)
         reset_tasks = graph.reset_interrupted_tasks()
+
+        if state.plan_versions:
+            self._plan_versions[execution_id] = PlanVersion.from_dict(state.plan_versions[-1])
+        else:
+            restored = PlanVersion.initial(graph.to_dict(), change_reason="restored on resume")
+            self._plan_versions[execution_id] = restored
+            state.record_plan_version(restored.to_dict())
 
         self.event_log.emit(
             "RESUME",
@@ -403,12 +446,63 @@ class Orchestrator:
             model=output.model,
         )
 
-        evaluation = self.evaluator.evaluate(task, output)
+        return await self._evaluate_and_act(task, output, agent, agent_input, graph, context, execution_state, memory_manager)
+
+    async def _evaluate_and_act(
+        self,
+        task: Task,
+        output: AgentOutput,
+        agent: BaseAgent,
+        agent_input: AgentInput,
+        graph: TaskGraph,
+        context: ContextManager,
+        execution_state: ExecutionState,
+        memory_manager: MemoryManager,
+    ) -> Action:
+        """Independently judges ``output`` (never trusting the agent's own
+        success claim) and drives the resulting CONTINUE/RETRY/REPAIR/
+        REPLAN/ABORT action - including looping a REPAIR back through the
+        same task without restarting the whole DAG."""
+        eval_context = EvaluationContext(
+            dependency_outputs=agent_input.upstream_outputs,
+            tool_results=[r for r in context.tool_results if r.get("task_id") == task.id],
+            artifacts=[a for a in execution_state.metadata.get("artifacts_detail", []) if a.get("task_id") == task.id],
+        )
+        self.event_log.emit("EVALUATION_STARTED", f"Evaluating task '{task.id}'", task_id=task.id, agent_id=agent.id)
+        try:
+            evaluation = await self.evaluator.evaluate(task, output, context=eval_context)
+        except Exception as exc:  # noqa: BLE001 - an evaluator crash is a failure signal, not a hard crash
+            self.event_log.emit(
+                "EVALUATION_FAILED", f"Evaluator raised on task '{task.id}': {exc}", task_id=task.id, error=str(exc)
+            )
+            evaluation = EvaluationResult(
+                status=EvaluationStatus.FAIL,
+                passed=False,
+                reasons=[f"Evaluator raised {type(exc).__name__}: {exc}"],
+                retry_possible=True,
+            )
+
+        self._last_evaluations[task.id] = evaluation
+        task.evaluation = {
+            "status": evaluation.status.value,
+            "score": evaluation.score,
+            "failed_criteria": evaluation.failed_criteria,
+            "reasons": evaluation.reasons,
+            "attempt": task.attempt,
+            "repair_attempt": task.repair_attempt,
+        }
+        execution_state.record_evaluation(task.id, evaluation.to_dict())
+        self.event_log.emit(
+            "EVALUATION_COMPLETED",
+            f"Task '{task.id}' evaluated as {evaluation.status.value} (score={evaluation.score:.2f})",
+            task_id=task.id,
+            status=evaluation.status.value,
+        )
         self.event_log.emit(
             "EVALUATOR",
-            f"Task '{task.id}' evaluated as {evaluation.verdict.value}: {evaluation.reason}",
+            f"Task '{task.id}' evaluated as {evaluation.status.value}",
             task_id=task.id,
-            status=evaluation.verdict.value,
+            status=evaluation.status.value,
         )
 
         action = self.retry_policy.decide(task, evaluation, self.state)
@@ -421,8 +515,12 @@ class Orchestrator:
                 "TASK_STATE_CHANGED", f"Task '{task.id}' -> {task.status.value}", task_id=task.id, status=task.status.value
             )
             self._checkpoint(execution_state, graph, "task completion")
-            if evaluation.verdict == Verdict.SUCCESS:
+            if evaluation.status == EvaluationStatus.PASS:
                 self._extract_memory(task, output, memory_manager)
+        elif action == Action.REPAIR:
+            action = await self._repair_task(
+                task, output, evaluation, agent, agent_input, graph, context, execution_state, memory_manager
+            )
         elif action == Action.RETRY:
             task.retry_count += 1
             task.status = TaskStatus.RETRYING
@@ -465,6 +563,65 @@ class Orchestrator:
             self._checkpoint(execution_state, graph, "task failure")
 
         return action
+
+    async def _repair_task(
+        self,
+        task: Task,
+        previous_output: AgentOutput,
+        evaluation: EvaluationResult,
+        agent: BaseAgent,
+        agent_input: AgentInput,
+        graph: TaskGraph,
+        context: ContextManager,
+        execution_state: ExecutionState,
+        memory_manager: MemoryManager,
+    ) -> Action:
+        """Focused re-execution of ``task`` via ``RepairManager`` - the same
+        agent, called again with the failure feedback attached, never a
+        full task/DAG restart. Loops back through ``_evaluate_and_act`` so
+        a second REPAIR (up to ``task.max_repairs``) or an escalation to
+        REPLAN is handled the same way a fresh evaluation would be."""
+        task.repair_count += 1
+        self.event_log.emit(
+            "REPAIR_STARTED",
+            f"Repairing task '{task.id}' (attempt {task.repair_count}/{task.max_repairs})",
+            task_id=task.id,
+            agent_id=agent.id,
+            retry_count=task.repair_count,
+        )
+        self._checkpoint(execution_state, graph, "repair started")
+
+        events_before = len(self.event_log.events)
+        try:
+            new_output = await self.repair_manager.repair(
+                agent=agent, task=task, previous_output=previous_output, evaluation=evaluation, base_input=agent_input
+            )
+        except Exception as exc:  # noqa: BLE001 - a repair-attempt crash is a failed repair, not a hard crash
+            new_output = AgentOutput(success=False, error=f"{type(exc).__name__}: {exc}")
+
+        task.result = new_output
+        task.error = new_output.error
+        context.record_task_output(task.id, new_output)
+        # The repair attempt may itself call tools (e.g. re-running tests) -
+        # those results/artifacts must be visible to the re-evaluation below,
+        # exactly as they would be for a first attempt.
+        self._record_tool_results(task.id, events_before, context)
+        self._track_artifacts(task, agent, context, execution_state, events_before)
+
+        outcome = "succeeded" if new_output.success else "failed"
+        self.event_log.emit(
+            "REPAIR_COMPLETED" if new_output.success else "REPAIR_FAILED",
+            f"Repair attempt {task.repair_count} for task '{task.id}' {outcome}",
+            task_id=task.id,
+            agent_id=agent.id,
+            status=outcome,
+        )
+        execution_state.record_repair(task.id, attempt=task.repair_count, outcome=outcome)
+        self._checkpoint(execution_state, graph, "repair completed")
+
+        return await self._evaluate_and_act(
+            task, new_output, agent, agent_input, graph, context, execution_state, memory_manager
+        )
 
     def _retry_backoff_seconds(self, attempt: int) -> float:
         """Exponential backoff, capped, so a flaky task doesn't hammer the
@@ -567,27 +724,98 @@ class Orchestrator:
         failed_task: Task,
         execution_state: ExecutionState,
     ) -> bool:
+        """Turns a permanently-failed task into a minimal plan PATCH (never
+        a wholesale new plan): completed work is left untouched, and a
+        REPLACE_TASK op automatically rewires any BLOCKED dependents onto
+        the replacement so they get a real chance to run. Returns False
+        (task stays FAILED) if the replan budget is exhausted, the same
+        failure keeps recurring (loop protection), or the patch itself
+        can't be applied - never lets a bad patch crash the scheduler."""
         if not self.state.can_replan():
             return False
+
+        failure_reason = f"Task '{failed_task.id}' failed: {failed_task.error or 'unspecified failure'}"
+        signature = f"{failed_task.capability}::{failure_reason}"
+        if execution_state.failure_signatures.count(signature) >= MAX_REPEATED_FAILURE_SIGNATURE:
+            self.event_log.emit(
+                "LOOP_LIMIT_REACHED",
+                f"Failure signature repeated for task '{failed_task.id}' - stopping replanning to avoid an infinite loop",
+                task_id=failed_task.id,
+                extra={"signature": signature},
+            )
+            self._checkpoint(execution_state, graph, "loop limit reached")
+            return False
+        execution_state.record_failure_signature(signature)
+
         self.state.transition(RunStatus.REPLANNING)
+        self.event_log.emit(
+            "REPLAN_STARTED",
+            f"Replanning around failed task '{failed_task.id}'",
+            task_id=failed_task.id,
+            extra={"repair_attempts": failed_task.repair_count},
+        )
+        self._checkpoint(execution_state, graph, "replan started")
+
+        try:
+            capabilities = self.agent_registry.all_capabilities()
+            tools = [t.id for t in self.tool_registry.list_tools()]
+            evaluation = self._last_evaluations.get(failed_task.id)
+
+            ops, reason = await self.planner.replan(
+                goal,
+                graph=graph,
+                capabilities=capabilities,
+                tools=tools,
+                failed_task=failed_task,
+                failure_reason=failure_reason,
+                evaluation=evaluation,
+                repair_attempts=failed_task.repair_count,
+            )
+
+            existing_ids = set(graph.tasks.keys())
+            errors = apply_plan_patch(graph, ops)
+            for new_id in set(graph.tasks.keys()) - existing_ids:
+                new_task = graph.tasks[new_id]
+                new_task.max_retries = self.max_retries_per_task
+                new_task.max_repairs = self.max_repairs_per_task
+            graph.finalize()
+        except Exception as exc:  # noqa: BLE001 - a bad replan must not crash the scheduler
+            self.event_log.emit(
+                "REPLAN_COMPLETED",
+                f"Replan for task '{failed_task.id}' failed: {exc}",
+                task_id=failed_task.id,
+                status="failed",
+                error=str(exc),
+            )
+            self.state.record_replan()
+            execution_state.replans_used = self.state.replans_used
+            self.state.transition(RunStatus.EXECUTING)
+            self._checkpoint(execution_state, graph, "replan failed")
+            return False
+
         self.state.record_replan()
         execution_state.replans_used = self.state.replans_used
 
-        capabilities = self.agent_registry.all_capabilities()
-        tools = [t.id for t in self.tool_registry.list_tools()]
-        completed_summary = context.completed_summary(graph)
-
-        new_tasks = await self.planner.replan(
-            goal,
-            capabilities=capabilities,
-            tools=tools,
-            completed_summary=completed_summary,
-            failure_reason=f"Task '{failed_task.id}' failed: {failed_task.error}",
+        current_version = self._plan_versions.get(execution_state.execution_id) or PlanVersion.initial(graph.to_dict())
+        new_version = current_version.next_version(
+            graph.to_dict(), change_reason=reason, patch_ops=[op.to_dict() for op in ops]
         )
-        for task in new_tasks:
-            task.max_retries = self.max_retries_per_task
-            graph.add_task(task)
-        graph.finalize()
+        self._plan_versions[execution_state.execution_id] = new_version
+        execution_state.record_plan_version(new_version.to_dict())
+        execution_state.record_replan(failed_task_id=failed_task.id, reason=reason, plan_version=new_version.to_dict())
+        self.event_log.emit(
+            "PLAN_VERSION_CREATED",
+            f"Plan version {new_version.version} created (replan): {reason}",
+            extra={"execution_id": execution_state.execution_id, "plan_id": new_version.plan_id, "version": new_version.version},
+        )
+        self.event_log.emit(
+            "REPLAN_COMPLETED",
+            f"Replan applied {len(ops) - len(errors)}/{len(ops)} operation(s): {reason}"
+            + (f" (errors: {errors})" if errors else ""),
+            task_id=failed_task.id,
+            extra={"operations": [op.to_dict() for op in ops], "errors": errors},
+        )
+
         execution_state.current_plan = graph.to_dict()
         self.state.transition(RunStatus.EXECUTING)
         self.state_store.checkpoint(execution_state, self.event_log, "replan")

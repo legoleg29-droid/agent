@@ -73,16 +73,41 @@ async def test_plan_rejects_non_json_response():
 
 
 @pytest.mark.asyncio
-async def test_replan_produces_uniquely_ided_tasks_that_may_depend_on_completed_ids():
-    plan_json = {"tasks": [{"id": "t1", "objective": "Retry X", "capability": "research", "dependencies": ["already_done"], "required_tools": []}]}
-    planner = make_planner(plan_json)
-    new_tasks = await planner.replan(
+async def test_replan_produces_a_minimal_patch_not_a_wholesale_plan():
+    from orchestrator.core.task_graph import Task, TaskGraph, TaskStatus
+
+    graph = TaskGraph()
+    graph.add_task(Task(id="already_done", objective="prior work", capability="research", status=TaskStatus.SUCCEEDED))
+    graph.add_task(Task(id="t1", objective="do the thing", capability="research", dependencies=["already_done"], status=TaskStatus.FAILED))
+
+    patch_json = {
+        "reason": "t1 needs a different approach",
+        "operations": [
+            {
+                "op": "replace_task",
+                "task_id": "t1",
+                "task": {
+                    "id": "t1_v2",
+                    "objective": "Retry X differently",
+                    "capability": "research",
+                    "dependencies": ["already_done"],
+                    "required_tools": [],
+                },
+            }
+        ],
+    }
+    provider = MockProvider(responder=lambda system, messages, tools: json.dumps(patch_json))
+    planner = Planner(provider)
+
+    ops, reason = await planner.replan(
         "Do X",
+        graph=graph,
         capabilities=["research"],
         tools=[],
-        completed_summary={"already_done": "some prior result"},
+        failed_task=graph.tasks["t1"],
         failure_reason="original task failed",
     )
-    assert len(new_tasks) == 1
-    assert new_tasks[0].id != "t1"  # remapped to avoid collisions
-    assert "already_done" in new_tasks[0].dependencies
+    assert len(ops) == 1
+    assert ops[0].task["id"] == "t1_v2"
+    assert "already_done" in ops[0].task["dependencies"]
+    assert reason == "t1 needs a different approach"

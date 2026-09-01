@@ -26,6 +26,10 @@ class AgentInput:
     upstream_outputs: dict[str, Any] = field(default_factory=dict)
     memory_context: list[dict[str, Any]] = field(default_factory=list)
     constraints: list[str] = field(default_factory=list)
+    # Set only for a repair re-invocation (see orchestrator/core/repair.py):
+    # previous output, exactly which acceptance criteria failed and why, so
+    # the agent can focus on fixing that instead of starting over blind.
+    repair_feedback: dict[str, Any] | None = None
 
 
 @dataclass

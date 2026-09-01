@@ -177,6 +177,41 @@ class ExecutionState:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Phase 5: evaluation/self-repair/replanning history - append-only,
+    # never overwritten, so a run's full evaluation/repair/replan story is
+    # reconstructable from the checkpointed state alone.
+    evaluation_history: list[dict[str, Any]] = field(default_factory=list)
+    repair_history: list[dict[str, Any]] = field(default_factory=list)
+    replan_history: list[dict[str, Any]] = field(default_factory=list)
+    plan_version: int = 1
+    plan_versions: list[dict[str, Any]] = field(default_factory=list)
+    failure_signatures: list[str] = field(default_factory=list)
+    execution_metrics: dict[str, Any] = field(default_factory=dict)
+
+    def record_evaluation(self, task_id: str, evaluation: dict[str, Any]) -> None:
+        self.evaluation_history.append({"task_id": task_id, "timestamp": time.time(), **evaluation})
+        self.touch()
+
+    def record_repair(self, task_id: str, *, attempt: int, outcome: str, details: dict[str, Any] | None = None) -> None:
+        self.repair_history.append(
+            {"task_id": task_id, "attempt": attempt, "outcome": outcome, "timestamp": time.time(), **(details or {})}
+        )
+        self.touch()
+
+    def record_replan(self, *, failed_task_id: str, reason: str, plan_version: dict[str, Any]) -> None:
+        self.replan_history.append(
+            {"failed_task_id": failed_task_id, "reason": reason, "timestamp": time.time(), "plan_version": plan_version}
+        )
+        self.touch()
+
+    def record_plan_version(self, plan_version: dict[str, Any]) -> None:
+        self.plan_versions.append(plan_version)
+        self.plan_version = plan_version.get("version", self.plan_version)
+        self.touch()
+
+    def record_failure_signature(self, signature: str) -> None:
+        self.failure_signatures.append(signature)
+        self.touch()
 
     @classmethod
     def create(cls, user_goal: str, *, execution_id: str | None = None, max_replans: int = 2) -> ExecutionState:
@@ -243,6 +278,13 @@ class ExecutionState:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "metadata": self.metadata,
+            "evaluation_history": self.evaluation_history,
+            "repair_history": self.repair_history,
+            "replan_history": self.replan_history,
+            "plan_version": self.plan_version,
+            "plan_versions": self.plan_versions,
+            "failure_signatures": self.failure_signatures,
+            "execution_metrics": self.execution_metrics,
         }
 
     @classmethod
@@ -265,4 +307,11 @@ class ExecutionState:
             created_at=data.get("created_at", time.time()),
             updated_at=data.get("updated_at", time.time()),
             metadata=data.get("metadata", {}) or {},
+            evaluation_history=list(data.get("evaluation_history", []) or []),
+            repair_history=list(data.get("repair_history", []) or []),
+            replan_history=list(data.get("replan_history", []) or []),
+            plan_version=data.get("plan_version", 1),
+            plan_versions=list(data.get("plan_versions", []) or []),
+            failure_signatures=list(data.get("failure_signatures", []) or []),
+            execution_metrics=data.get("execution_metrics", {}) or {},
         )

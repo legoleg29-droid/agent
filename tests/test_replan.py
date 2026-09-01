@@ -15,10 +15,22 @@ INITIAL_PLAN = {
     ]
 }
 REPLAN = {
-    "tasks": [
-        {"id": "recovery", "objective": "Do a recoverable version of the task", "capability": "research", "dependencies": [], "required_tools": []},
-    ]
+    "reason": "t1 needs a recoverable approach",
+    "operations": [
+        {
+            "op": "replace_task",
+            "task_id": "t1",
+            "task": {
+                "id": "recovery",
+                "objective": "Do a recoverable version of the task",
+                "capability": "research",
+                "dependencies": [],
+                "required_tools": [],
+            },
+        }
+    ],
 }
+NO_RECOVERY_PATCH = {"reason": "no viable recovery", "operations": []}
 
 
 def responder_factory(replanned: dict):
@@ -26,7 +38,7 @@ def responder_factory(replanned: dict):
         last = messages[-1].content
         if last.startswith("User goal:"):
             return json.dumps(INITIAL_PLAN)
-        if "revision" in last or "needs revision" in last:
+        if "Failed task:" in last:
             return json.dumps(replanned["plan"])
         return "Final result after recovery."
 
@@ -62,7 +74,7 @@ async def test_replan_budget_is_respected_and_run_aborts_safely():
     failing_agent = StubAgent("failing_agent", ["research"], always_fails("boom"))
     registry.register(failing_agent)
 
-    provider = MockProvider(responder=responder_factory({"plan": INITIAL_PLAN}))
+    provider = MockProvider(responder=responder_factory({"plan": NO_RECOVERY_PATCH}))
     orchestrator = Orchestrator(
         provider, registry, ToolRegistry(), max_retries_per_task=0, max_replans=1, verbose_logging=False
     )

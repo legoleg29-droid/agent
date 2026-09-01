@@ -32,6 +32,7 @@ from orchestrator.providers.mock_provider import ScriptedToolUse
 from orchestrator.memory.long_term import SQLiteLongTermMemory
 from orchestrator.state.store import SQLiteStateStore
 from orchestrator.tools.calculator_tool import CalculatorTool
+from orchestrator.tools.code_execution_tool import RunPythonTestsTool
 from orchestrator.tools.file_tools import FileReadTool, FileWriteTool, ListFilesTool
 from orchestrator.tools.registry import ToolRegistry
 from orchestrator.tools.sandbox import FileSandbox
@@ -229,6 +230,7 @@ def build_orchestrator(provider: LLMProvider, *, use_mock: bool) -> Orchestrator
     tool_registry.register(FileReadTool(sandbox))
     tool_registry.register(FileWriteTool(sandbox))
     tool_registry.register(ListFilesTool(sandbox))
+    tool_registry.register(RunPythonTestsTool(sandbox, timeout_seconds=tool_timeout))
 
     # State/memory persistence: SQLite by default so `--resume` works across
     # process restarts. --mock runs get their own db file so demo runs never
@@ -245,12 +247,14 @@ def build_orchestrator(provider: LLMProvider, *, use_mock: bool) -> Orchestrator
         agent_registry,
         tool_registry,
         max_retries_per_task=int(os.environ.get("ORCHESTRATOR_MAX_RETRIES_PER_TASK", 2)),
+        max_repairs_per_task=int(os.environ.get("ORCHESTRATOR_MAX_REPAIRS_PER_TASK", 2)),
         max_replans=int(os.environ.get("ORCHESTRATOR_MAX_REPLANS", 2)),
         state_store=state_store,
         long_term_memory=long_term_memory,
         max_concurrent_tasks=int(os.environ.get("ORCHESTRATOR_MAX_CONCURRENT_TASKS", 5)),
         retry_backoff_base_seconds=float(os.environ.get("ORCHESTRATOR_RETRY_BACKOFF_BASE_SECONDS", 0.5)),
         max_retry_backoff_seconds=float(os.environ.get("ORCHESTRATOR_MAX_RETRY_BACKOFF_SECONDS", 10)),
+        sandbox=sandbox,
     )
     orchestrator.tool_runtime.default_timeout_seconds = tool_timeout
     print(f"[main] Persisting execution state + memory to: {db_path}", file=sys.stderr)

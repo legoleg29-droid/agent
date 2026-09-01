@@ -187,13 +187,22 @@ async def test_replan_hook_is_reachable_and_can_splice_in_a_recovery_task():
     registry.register(agent)
 
     plan = {"tasks": [{"id": "t1", "objective": "a", "capability": "research", "dependencies": [], "required_tools": []}]}
-    replan = {"tasks": [{"id": "t1_recovery", "objective": "recover", "capability": "research", "dependencies": [], "required_tools": []}]}
+    replan = {
+        "reason": "recover t1",
+        "operations": [
+            {
+                "op": "replace_task",
+                "task_id": "t1",
+                "task": {"id": "t1_recovery", "objective": "recover", "capability": "research", "dependencies": [], "required_tools": []},
+            }
+        ],
+    }
 
     def responder(system, messages, tools):
         last = messages[-1].content
         if last.startswith("User goal:"):
             return json.dumps(plan)
-        if "needs revision" in last:
+        if "Failed task:" in last:
             return json.dumps(replan)
         return "final"
 

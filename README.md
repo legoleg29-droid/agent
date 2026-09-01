@@ -476,6 +476,126 @@ Shared by both persistence paths:
 `MEMORY_RETRIEVED`, `MEMORY_SKIPPED`, `CHECKPOINT`, `RESUME` - alongside
 the Phase 1/2 tags listed under [Observability](#observability).
 
+## Evaluation, Self-Repair & Replanning
+
+An agent's own `success=True`/textual claim is never trusted as the final
+word. Every task result passes through `Evaluator` (`orchestrator/core/evaluator.py`),
+which judges it independently and produces a structured `EvaluationResult`
+(`orchestrator/core/evaluation_models.py`): `status` (`pass` / `partial` /
+`fail` / `invalid` / `repair_required` / `replan_required`), `score`,
+`failed_criteria`, `reasons`, `evidence`, `confidence`, and explicit
+`retry_possible`/`repair_possible`/`replan_required` flags.
+
+### Layered, deterministic-first evaluation
+
+1. **Structural** - did the agent report success, is the output non-empty,
+   no refusal language. A structural failure is retry-eligible (it's an
+   execution-level problem, not a bad result).
+2. **Deterministic** - explicit, tool-backed acceptance criteria set on the
+   task: `file_exists`, `artifact_exists`, `contains`/`not_contains`,
+   `json_valid`, `min_length`, `tool_succeeded` (checks the task's own
+   recorded tool results - e.g. "did `run_python_tests` actually pass").
+   For code, this is how tests get independently re-verified rather than
+   trusted from the agent's summary.
+3. **Semantic** (LLM judge, `EvaluationPolicy.requires_semantic_evaluation`
+   decides whether it's even needed - default: only when a free-text
+   criterion remains) - a *separate* Claude call with its own strict system
+   prompt (`_JUDGE_SYSTEM`), told explicitly "you did NOT produce this
+   output, don't rubber-stamp its own claims", asked to mark each criterion
+   SATISFIED/VIOLATED with concrete evidence. Combined with the
+   deterministic result 60/40 in the deterministic result's favor
+   (`Evaluator._combine`) - deterministic evidence outranks a model's
+   subjective score.
+
+A clean deterministic PASS/FAIL never triggers an LLM call.
+
+### Retry vs. Repair vs. Replan
+
+`RetryPolicy.decide()` (`orchestrator/core/retry.py`) maps an
+`EvaluationResult` onto one action:
+
+| Action | When | What happens |
+|---|---|---|
+| `CONTINUE` | PASS or PARTIAL | task marked `SUCCEEDED` |
+| `RETRY` | structural/transient failure, under `max_retries` | same task re-executed from scratch, with backoff |
+| `REPAIR` | completed but fails acceptance criteria, under `max_repairs` | `RepairManager` re-invokes the *same agent* with the previous output + failed criteria + evaluator evidence attached (`AgentInput.repair_feedback`) - a focused fix, not a fresh attempt |
+| `REPLAN` | retry/repair budget exhausted, or the approach itself is unsuitable | `Planner.replan()` produces a minimal plan patch around just the failed task |
+| `ABORT` | nothing above applies (e.g. replan budget also exhausted) | task marked `FAILED`, isolated by the scheduler's failure cascade like any Phase 4 failure |
+
+Repeated repair failure escalates automatically: `Evaluator._finalize()`
+flips `REPAIR_REQUIRED` to `REPLAN_REQUIRED` once `task.repair_count >=
+task.max_repairs` (or the score is too low for repair to be worth trying -
+`EvaluationPolicy.min_score_for_repair`), so a hopeless repair loop turns
+into a replan instead of spinning forever.
+
+### Plan patching, not wholesale replanning
+
+`Planner.replan()` no longer regenerates the whole plan. It receives the
+live graph (completed/failed/blocked tasks), the evaluator's own findings,
+and how many repairs were already tried, and returns a minimal
+`list[PlanPatchOp]` (`orchestrator/core/plan_patch.py`):
+`ADD_TASK`/`REMOVE_TASK`/`REPLACE_TASK`/`MODIFY_TASK`/`ADD_DEPENDENCY`/`REMOVE_DEPENDENCY`.
+`apply_plan_patch()` applies them to the live `TaskGraph`; a bad individual
+op is reported as an error string, never crashes the run.
+
+`REPLACE_TASK` is the one that matters most for recovery: adding the
+replacement task automatically rewires every dependent that pointed at the
+old (failed) task onto the new one, and resets a `BLOCKED` dependent back
+to `PENDING` so it actually gets to run - so `A -> B -> C` with `B`
+permanently failing becomes `A -> B2 -> C` without `A` ever re-running and
+without the orchestrator special-casing `C`. The old task is marked
+`metadata["superseded_by"]`, so it stops counting as a live failure once
+its replacement succeeds.
+
+Completed work is never touched by a replan unless a task is explicitly
+`invalidate_task()`-ed (`TaskStatus.INVALIDATED`, not terminal -
+`reactivate_invalidated_tasks()` resets it to `PENDING` for re-verification)
+- dependents are never auto-invalidated.
+
+Every plan (initial or patched) gets a `PlanVersion` (`orchestrator/core/plan_version.py`,
+`plan_id`/`version`/`parent_plan_id`/`change_reason`/`graph_snapshot`) -
+appended to `ExecutionState.plan_versions`, never overwritten.
+
+### Loop protection
+
+`Orchestrator._replan()` tracks a failure *signature*
+(`f"{task.capability}::{failure_reason}"`) on `ExecutionState.failure_signatures`;
+if the same signature recurs (`MAX_REPEATED_FAILURE_SIGNATURE`, default 2)
+replanning stops (`LOOP_LIMIT_REACHED`) instead of oscillating forever. Retry
+and repair are separately budget-capped per task (`max_retries`/`max_repairs`),
+and replans are budget-capped per run (`max_replans`) - each layer has its
+own hard stop.
+
+### Code evaluation without self-certification
+
+`RunPythonTestsTool` (`orchestrator/tools/code_execution_tool.py`) runs
+`python -m pytest <sandboxed path>` via `asyncio.create_subprocess_exec`
+(argv list, never a shell string) and reports the tests' real exit code -
+a failing test run is reported as a tool failure, not tool success, so a
+`tool_succeeded: run_python_tests` acceptance criterion means what it says.
+`CodingAgent` has this tool available and is told to run its own tests
+before claiming done - but the evaluator re-runs/re-checks independently
+regardless of what the agent reports.
+
+### Observability tags (evaluation/repair/replan)
+
+`EVALUATION_STARTED`, `EVALUATION_COMPLETED`, `EVALUATION_FAILED`,
+`REPAIR_STARTED`, `REPAIR_COMPLETED`, `REPAIR_FAILED`, `REPLAN_STARTED`,
+`REPLAN_COMPLETED`, `TASK_INVALIDATED`, `PLAN_VERSION_CREATED`,
+`LOOP_LIMIT_REACHED` - alongside the tags listed under
+[Observability](#observability). `ExecutionState` also keeps append-only
+`evaluation_history`/`repair_history`/`replan_history` and
+`execution_metrics`, so a run's full self-repair story survives a
+checkpoint/resume.
+
+See `tests/test_evaluator.py`, `tests/test_retry.py`,
+`tests/test_evaluation_policy.py`, `tests/test_error_classification.py`,
+`tests/test_repair_manager.py`, `tests/test_plan_patch.py`,
+`tests/test_plan_version.py`, `tests/test_task_invalidation.py`, and the
+two end-to-end scenarios in `tests/test_phase5_e2e.py`
+(`test_coding_self_repair_end_to_end`,
+`test_replanning_b_to_b2_never_re_executes_a`).
+
 ## Installation
 
 Requires Python 3.11+.
@@ -492,7 +612,8 @@ cp .env.example .env                   # then fill in ANTHROPIC_API_KEY
 |---|---|---|---|
 | `ANTHROPIC_API_KEY` | Yes (for real runs) | - | Claude API key |
 | `ANTHROPIC_MODEL` | No | `claude-sonnet-4-5-20250929` | Claude model id |
-| `ORCHESTRATOR_MAX_RETRIES_PER_TASK` | No | `2` | Per-task retry budget |
+| `ORCHESTRATOR_MAX_RETRIES_PER_TASK` | No | `2` | Per-task retry budget (transient failures) |
+| `ORCHESTRATOR_MAX_REPAIRS_PER_TASK` | No | `2` | Per-task repair budget (completed but doesn't satisfy acceptance criteria) |
 | `ORCHESTRATOR_MAX_REPLANS` | No | `2` | Per-run re-plan budget |
 | `ORCHESTRATOR_SANDBOX_DIR` | No | `./sandbox` | Root directory for `file_read`/`file_write`/`list_files` - no path can escape it |
 | `ORCHESTRATOR_TOOL_TIMEOUT_SECONDS` | No | `30` | Default per-tool execution timeout |
@@ -1018,16 +1139,23 @@ in-process test doubles) covers:
 
 ```
 orchestrator/
-  core/        orchestrator loop, planner, router, task graph/DAG,
-               DAG scheduler (concurrency, locking, pause/cancel, metrics),
-               context, state, evaluator, retry, synthesizer, logging
+  core/        orchestrator loop, planner (plan + patch-based replan),
+               router, task graph/DAG, DAG scheduler (concurrency, locking,
+               pause/cancel, metrics), context, state, evaluator (layered,
+               deterministic-first), evaluation_models/evaluation_policy,
+               error_classification, repair (RepairManager), retry
+               (RetryPolicy: retry/repair/replan/abort), plan_patch
+               (PlanPatchOp/apply_plan_patch), plan_version (PlanVersion
+               history), synthesizer, logging
   agents/      BaseAgent, AgentRegistry, ResearchAgent, AnalysisAgent,
-               CodingAgent, WriterAgent, LLMAgent (Claude tool-use loop)
+               CodingAgent, WriterAgent, LLMAgent (Claude tool-use loop,
+               including the repair-feedback prompt path)
   tools/       BaseTool, ToolRegistry, ToolRuntime, schema_validation,
                permissions, sandbox (FileSandbox), file_tools
                (FileReadTool/FileWriteTool/ListFilesTool), calculator_tool,
-               web_search_tool, mcp_adapter (MCPToolAdapter, MCPClient,
-               register_mcp_server)
+               web_search_tool, code_execution_tool (RunPythonTestsTool -
+               independently re-runs tests, never trusts the agent's claim),
+               mcp_adapter (MCPToolAdapter, MCPClient, register_mcp_server)
   providers/   LLMProvider, ClaudeProvider (native tool-use), MockProvider
                (ScriptedToolUse for offline tool-loop testing)
   state/       ExecutionState, TaskState, AgentState, ToolState, Artifact,
@@ -1048,10 +1176,29 @@ main.py        CLI entry point (supports --resume EXECUTION_ID)
   a real search API - swap its implementation (or register a different
   tool under the same id) for production use; the tool abstraction is
   designed so that requires no agent/orchestrator changes.
-- The `Evaluator` is rule-based (empty/short output, refusal language,
-  reported errors) rather than an LLM-as-judge; it's easy to extend with
-  an LLM-backed check by giving `Evaluator` a provider, but the default
-  keeps evaluation fast, deterministic, and cheap.
+- The `Evaluator` runs a deterministic-first pass (structural + acceptance
+  criteria) and only calls an LLM judge when a free-text criterion remains
+  unverified (`EvaluationPolicy.semantic_trigger`, default
+  `on_free_text_criteria`) - this keeps most evaluations fast and free of
+  model calls, but means a task with zero acceptance criteria and no
+  free-text expectation gets only a shallow deterministic pass (non-empty,
+  no refusal language, minimum length) rather than a semantic review;
+  give tasks explicit `acceptance_criteria` for anything that actually
+  matters.
+- A single acceptance criterion that fails outright yields a deterministic
+  score of `0`, which reads as a terminal `FAIL` rather than
+  `REPAIR_REQUIRED` (repair needs some partial credit to be worth
+  attempting - see `EvaluationPolicy.min_score_for_repair`); tasks meant to
+  support repair should carry more than one criterion.
+- Loop protection (`MAX_REPEATED_FAILURE_SIGNATURE` in
+  `orchestrator/core/orchestrator.py`) keys off `f"{capability}::{failure_reason}"`,
+  a coarse signature - it stops an exact repeat quickly but won't catch a
+  replan that oscillates between two *different*-looking failure strings
+  for the same underlying cause.
+- `RunPythonTestsTool` only runs `pytest`; other languages/test runners
+  need an equivalent tool registered the same way (narrowly scoped,
+  argv-list subprocess, sandboxed cwd, real exit code reported as the
+  tool's own success/failure).
 - `orchestrator/tools/mcp_adapter.py` defines the client protocol,
   auto-discovery, and adapter that make MCP tools indistinguishable from
   native ones, but this repository does not ship a concrete MCP wire

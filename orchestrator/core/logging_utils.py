@@ -40,6 +40,20 @@ VALID_TAGS = {
     "MEMORY_SKIPPED",
     "CHECKPOINT",
     "RESUME",
+    # DAG scheduler lifecycle (Phase 4).
+    "SCHEDULER_STARTED",
+    "SCHEDULER_WAITING",
+    "SCHEDULER_RESUMED",
+    "SCHEDULER_COMPLETED",
+    "TASK_READY",
+    "TASK_STARTED",
+    "TASK_COMPLETED",
+    "TASK_FAILED",
+    "TASK_RETRYING",
+    "TASK_BLOCKED",
+    "TASK_CANCELLED",
+    "EXECUTION_PAUSED",
+    "EXECUTION_RESUMED",
 }
 
 _logger = logging.getLogger("orchestrator")

@@ -22,22 +22,20 @@ ORCHESTRATOR        core/orchestrator.py
   |
 PLANNER             core/planner.py         - goal -> Task DAG (via LLM)
   |
-TASK GRAPH          core/task_graph.py      - DAG, dependency resolution
+TASK GRAPH / DAG    core/task_graph.py      - DAG, dependency resolution, cycle detection
   |
-SCHEDULER           core/orchestrator.py    - dependency-ordered + parallel dispatch
+DAG SCHEDULER       core/scheduler.py       - concurrency-bounded, dependency-aware dispatch
   |
-AGENT RUNTIME       agents/base.py + agents/*.py + agents/_common.py
-  |                 (structured Claude tool-use loop)
+  ├──────────────┬──────────────┬──────────────┐
+  v              v              v              v
+AGENT A        AGENT B        AGENT C        AGENT ...   agents/base.py + agents/*.py
+  |              |              |              |          (structured Claude tool-use loop)
+TOOLS          TOOLS          TOOLS          TOOLS         tools/runtime.py - permission check,
+  └──────────────┴──────────────┴──────────────┘           input/output validation, timeout
+                        |
 CONTEXT MANAGER     core/context.py + core/context_budget.py
   |                 (budgeted: task + deps + tool results + memory + constraints)
-MEMORY / STATE      state/*, memory/*        - Runtime State + Short/Long-Term Memory
-  |
-TOOL RUNTIME        tools/runtime.py        - permission check, input/output
-  |                                           validation, timeout, observability
-MCP / NATIVE TOOLS / APIS
-  |                 tools/registry.py, tools/mcp_adapter.py,
-  |                 tools/file_tools.py, tools/calculator_tool.py, ...
-RESULT
+STATE / MEMORY      state/*, memory/*        - Runtime State + Short/Long-Term Memory
   |
 EVALUATOR           core/evaluator.py       - independent result judging
   |
@@ -45,6 +43,13 @@ CHECKPOINT          state/store.py          - persist after every key transition
   |
 REPLAN / COMPLETE   core/retry.py, core/synthesizer.py
 ```
+
+Independent tasks run genuinely concurrently (bounded by
+`max_concurrent_tasks`), each with its own agent/tool calls; the scheduler
+converges everything back through the same Context Manager / State &
+Memory / Evaluator / Checkpoint pipeline per task before deciding
+replan-or-complete for the whole execution. See
+[DAG Scheduler & Parallel Execution](#dag-scheduler--parallel-execution) below.
 
 Supporting components: `Agent Registry` (`agents/registry.py`, capability-indexed
 agent lookup), `State Manager` (`core/state.py`, in-loop run status and replan
@@ -110,6 +115,180 @@ agents by capability, and the `AgentRouter` looks up candidates for a
 task's required capability, preferring one that also covers the task's
 `required_tools`. Adding a new agent (see below) never requires editing
 the orchestrator.
+
+## DAG Scheduler & Parallel Execution
+
+`orchestrator/core/scheduler.py`'s `DAGScheduler` is deliberately decoupled
+from `ContextManager`/`MemoryManager`/`ExecutionState` - it operates purely
+on a `TaskGraph` plus one injected async callback that executes a task and
+returns the `Action` outcome (continue/retry/replan/abort). The
+`Orchestrator` supplies that callback (bound to `_run_task`, which owns
+routing, tool execution, evaluation, retry/backoff, and checkpointing), so
+the scheduler is independently testable with plain mock callables - see
+`tests/test_scheduler.py` and `tests/test_scheduler_stress.py`.
+
+### Task states and transitions
+
+```
+PENDING -> READY -> RUNNING -> SUCCEEDED
+                        |
+                        +-> RETRYING -> RUNNING (backoff, bounded by max_retries)
+                        |
+                        +-> FAILED -> (dependents) BLOCKED
+                        |
+                        +-> CANCELLED (execution cancelled)
+
+WAITING   reserved for a future "waiting on external input" state - not
+          yet produced by the scheduler.
+```
+
+`PENDING` means "not yet claimed" (deps may or may not be satisfied yet);
+`READY` means "deps satisfied, claimed by the scheduler, about to run" -
+distinguishing "eligible" from "actually dispatched" is what makes the
+concurrency limit visible: a 6th ready task among 5 running ones sits in
+`READY`, not `RUNNING`, until a slot frees. `BLOCKED` and `CANCELLED` (along
+with `SUCCEEDED`/`FAILED`/the legacy `SKIPPED`) are terminal.
+
+### Ready-task detection
+
+A task is ready when it's `PENDING`, every dependency is `SUCCEEDED`, and
+(via `TaskGraph.validate()`) its capability/tools are actually registered.
+`TaskGraph.get_ready_tasks()` recomputes this on every scheduler tick, so
+completing `A` immediately surfaces `B`/`C`/`D` as ready without any manual
+bookkeeping - matching the spec's exact walkthrough (`tests/test_dag_graph.py::test_ready_task_detection_matches_spec_example`).
+
+### Parallel execution and the concurrency limit
+
+The scheduler claims every currently-ready task in one pass (synchronously,
+no `await` in between - see "Task locking" below), then launches each
+under an `asyncio.Semaphore(max_concurrent_tasks)`. With 20 ready tasks and
+`max_concurrent_tasks=5`, all 20 are claimed (`READY`) immediately but only
+5 actually run (`RUNNING`) at once; as each finishes, the next queued one
+acquires the freed slot. The main loop drives this with
+`asyncio.wait(in_flight, return_when=FIRST_COMPLETED)` - no polling, no
+thread pool, native `asyncio` only.
+
+```python
+scheduler = DAGScheduler(
+    graph,
+    execute_task=my_async_task_executor,       # Task -> Action
+    resource_limits=ResourceLimits(max_concurrent_tasks=5),
+    on_replan_needed=my_async_replan_hook,      # Task -> bool
+)
+result = await scheduler.run()  # SchedulerResult: COMPLETED/FAILED/BLOCKED/CANCELLED/PAUSED
+```
+
+`ResourceLimits` also carries `max_execution_time_seconds` (enforced - the
+scheduler self-cancels past the deadline), `max_total_tasks` (rejected at
+construction if the graph already exceeds it), and reserved-for-later
+fields (`max_concurrent_agents`, `max_concurrent_tool_calls`, `max_tokens`)
+that aren't enforced yet but give the interface somewhere to grow without
+a breaking change.
+
+### Task locking (no duplicate execution)
+
+A task can never be dispatched twice - by a concurrent scheduler tick, a
+retry, a resume, or a process restart - because claiming
+(`PENDING -> READY`) happens synchronously inside the dispatch loop, with
+no `await` between the `get_ready_tasks()` read and the status write.
+Since asyncio is single-threaded/cooperative, nothing can interleave in
+that gap. `tests/test_scheduler.py::test_ready_tasks_claimed_synchronously_cannot_race_across_ticks`
+and the 25-task stress test both assert every task executes exactly once.
+
+### Failure isolation
+
+A task's own permanent failure only cascades `BLOCKED` to its *own*
+dependents (`TaskGraph.mark_blocked_by_failed_dependencies()`, a
+transitive fixpoint) - independent branches keep running and can still
+complete normally. This replaced Phase 1-3's coarser "abort the whole
+graph on any permanent failure": now the run's overall result reflects
+exactly what actually broke (`FAILED` if a task itself failed, `BLOCKED`
+if nothing failed outright but something couldn't run, `COMPLETED`
+otherwise) instead of one failure taking down unrelated work.
+
+```
+A ── COMPLETED
+B ── FAILED
+C ── COMPLETED
+D ── depends on A + C  -> still runs (COMPLETED)
+E ── depends on B      -> BLOCKED (never runs, unless a replan supersedes it)
+```
+
+### Retry and backoff
+
+Retries are driven by the existing Phase 1-3 `RetryPolicy`/`Evaluator`
+pipeline inside `_run_task`, now with explicit backoff:
+`RUNNING -> RETRYING -> RUNNING`, waiting `retry_backoff_base_seconds *
+2^(attempt-1)` (capped at `max_retry_backoff_seconds`) between attempts,
+respecting `Task.max_retries`. A `TASK_RETRYING` event carries the computed
+`backoff_seconds`. This happens inside one scheduler-dispatched task's
+lifecycle (invisible to the scheduler itself, which only sees the final
+outcome), so no separate re-queueing step is needed.
+
+### Pause / resume / cancellation
+
+```python
+orchestrator.pause_execution(execution_id)   # stop scheduling new tasks;
+                                              # already-running ones finish;
+                                              # persists PAUSED
+orchestrator.cancel_execution(execution_id)  # stop scheduling new tasks;
+                                              # cancel in-flight ones;
+                                              # mark everything unfinished
+                                              # CANCELLED (never COMPLETED);
+                                              # persists CANCELLED
+await orchestrator.resume_execution(execution_id)  # continues a PAUSED
+                                                    # (or crashed) execution
+```
+
+If the execution is actively running on the same `Orchestrator` instance,
+`pause_execution`/`cancel_execution` signal the *live* `DAGScheduler`
+(tracked in `Orchestrator._active_schedulers`) from another
+coroutine/task - see `tests/test_execution_pause_cancel.py`. If it isn't
+live in this process, both fall back to best-effort: mark the persisted
+`ExecutionState` directly, since another process can't be signaled
+in-process anyway (only real distributed cancellation - e.g. a lock/flag
+in a shared store another worker polls - would reach that case, which is
+out of scope for the local-development backends here).
+
+### Crash recovery mid-parallel-execution
+
+Building on Phase 3's checkpointing: a task still `RUNNING`/`READY`/
+`RETRYING` when the process dies is reset to `PENDING` on
+`resume_execution()` (`TaskGraph.reset_interrupted_tasks()`) and retried
+from scratch; anything already `SUCCEEDED`/`FAILED`/`BLOCKED`/`CANCELLED`
+is left alone. `tests/test_dag_orchestrator_integration.py::test_crash_recovery_matches_the_exact_spec_scenario`
+reproduces the spec's exact walkthrough (A and B completed, C mid-flight,
+D still pending, simulated shutdown, restart, resume) and asserts A/B are
+never re-executed.
+
+### Replan integration
+
+The scheduler's only replanning responsibility is calling the injected
+`on_replan_needed(task)` hook when a task's outcome is `Action.REPLAN` - it
+doesn't know or care what that hook does. The `Orchestrator` wires it to
+the same `Planner.replan()` path used since Phase 3: on success, new tasks
+are spliced into the live graph and picked up by the ordinary
+`get_ready_tasks()` dispatch on the next tick, no scheduler-specific
+replan logic required. If replanning fails (budget exhausted), the failing
+task's dependents are simply `BLOCKED` rather than the whole run aborting -
+see `tests/test_scheduler.py::test_replan_hook_invoked_on_replan_action_and_can_rescue_the_run`.
+
+### Metrics
+
+`DAGScheduler.metrics` (`SchedulerMetrics`): `total_tasks`,
+`completed_tasks`, `failed_tasks`, `blocked_tasks`, `cancelled_tasks`,
+`retried_tasks`, `peak_concurrency`, `execution_duration_seconds`.
+Surfaced on `ExecutionState.metadata["scheduler_metrics"]` and printed by
+`main.py` after every run - these are what a future dashboard would read.
+
+### Observability tags (scheduler)
+
+`SCHEDULER_STARTED`, `SCHEDULER_WAITING`, `SCHEDULER_RESUMED`,
+`SCHEDULER_COMPLETED`, `TASK_READY`, `TASK_STARTED`, `TASK_COMPLETED`,
+`TASK_FAILED`, `TASK_RETRYING`, `TASK_BLOCKED`, `TASK_CANCELLED`,
+`EXECUTION_PAUSED`, `EXECUTION_RESUMED` - each carries `execution_id`,
+`task_id`, `agent_id`, `status`, `duration_ms`/`retry_count` where
+applicable, and never task content/context (only ids, status, timing).
 
 ## State & Memory
 
@@ -319,6 +498,9 @@ cp .env.example .env                   # then fill in ANTHROPIC_API_KEY
 | `ORCHESTRATOR_TOOL_TIMEOUT_SECONDS` | No | `30` | Default per-tool execution timeout |
 | `ORCHESTRATOR_STATE_DB` | No | `./orchestrator_state.db` | SQLite file for execution-state checkpoints + long-term memory |
 | `ORCHESTRATOR_MOCK_STATE_DB` | No | `./orchestrator_state.mock.db` | Separate db for `--mock` runs so they never collide with real ones |
+| `ORCHESTRATOR_MAX_CONCURRENT_TASKS` | No | `5` | Max tasks the DAG scheduler runs at once |
+| `ORCHESTRATOR_RETRY_BACKOFF_BASE_SECONDS` | No | `0.5` | Retry backoff base (attempt N waits `base * 2^(N-1)`) |
+| `ORCHESTRATOR_MAX_RETRY_BACKOFF_SECONDS` | No | `10` | Retry backoff cap |
 
 No secrets are hardcoded anywhere in the codebase; `ClaudeProvider` reads
 `ANTHROPIC_API_KEY` from the environment and raises immediately if it's
@@ -753,7 +935,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The suite (170 tests, all offline/deterministic via `MockProvider` and
+The suite (227 tests, all offline/deterministic via `MockProvider` and
 in-process test doubles) covers:
 
 - Planner (plan generation, validation, rejection of bad output, replanning)
@@ -807,13 +989,38 @@ in-process test doubles) covers:
   checkpointed at every required transition, final result generated,
   execution marked completed; then interrupted after the research task and
   resumed without re-running it - `tests/test_phase3_e2e.py`
+- DAG graph API - creation, duplicate/missing-id validation, cycle
+  detection (raising and non-raising), `add_dependency`/`remove_task`
+  cycle/dangling-dependent rejection, `get_dependencies`/`get_dependents`,
+  ready-task detection matching the spec's exact A/B/C/D walkthrough,
+  failure isolation vs. full-abort cascades - `tests/test_dag_graph.py`
+- DAG scheduler unit tests - the deterministic parallel-execution scenario
+  from the spec (A -> B,C,D -> E,F, with wall-clock proof of real
+  concurrency), concurrency-limit enforcement, no-duplicate-dispatch,
+  failure isolation, the replan hook, pause/resume, cancellation, metrics,
+  never swallowing an unexpected exception - `tests/test_scheduler.py`
+- Stress test - 25 tasks (5 independent chains of 5) at concurrency 5:
+  concurrency cap never exceeded, every task executes exactly once,
+  scattered permanent failures only block their own chain, scheduler
+  terminates - `tests/test_scheduler_stress.py`
+- DAG/orchestrator integration - retry backoff (`TASK_RETRYING` with
+  increasing/capped backoff, bounded by `max_retries`), the exact
+  crash-recovery scenario from the spec (A/B completed, C running, D
+  pending, simulated shutdown, resume), replan integration with failure
+  isolation through the full orchestrator, and parallel context safety
+  (concurrent siblings never see each other's private output) -
+  `tests/test_dag_orchestrator_integration.py`
+- `pause_execution`/`cancel_execution` against both a live, in-process run
+  (signaled from another coroutine while `run()` is in flight) and an
+  offline persisted-only execution - `tests/test_execution_pause_cancel.py`
 
 ## Repository layout
 
 ```
 orchestrator/
-  core/        orchestrator loop, planner, router, task graph, context,
-               state, evaluator, retry, synthesizer, logging
+  core/        orchestrator loop, planner, router, task graph/DAG,
+               DAG scheduler (concurrency, locking, pause/cancel, metrics),
+               context, state, evaluator, retry, synthesizer, logging
   agents/      BaseAgent, AgentRegistry, ResearchAgent, AnalysisAgent,
                CodingAgent, WriterAgent, LLMAgent (Claude tool-use loop)
   tools/       BaseTool, ToolRegistry, ToolRuntime, schema_validation,
@@ -880,3 +1087,28 @@ main.py        CLI entry point (supports --resume EXECUTION_ID)
   `RESUME` events show - calling it on an already-completed execution is
   safe (no task re-runs) but re-synthesizes the final result and
   checkpoints again rather than short-circuiting immediately.
+- Cancellation stops *new* dispatch immediately and never marks an
+  unfinished task completed, but an already-running task only actually
+  stops at its next `await` boundary (`fut.cancel()` delivers
+  `asyncio.CancelledError` there) - a task deep inside a non-yielding
+  synchronous stretch (rare, since agent/tool calls are all `await`-heavy)
+  would finish that stretch before noticing. There's no forceful
+  mid-instruction kill, by design (that's what `asyncio.Task.cancel()`
+  fundamentally offers).
+- `max_concurrent_agents`/`max_concurrent_tool_calls`/`max_tokens` on
+  `ResourceLimits` are reserved fields, not yet enforced - per the spec's
+  "do not over-engineer resource limits yet," only `max_concurrent_tasks`,
+  `max_execution_time_seconds`, and `max_total_tasks` are actually applied
+  today. A tool-call-level concurrency cap would need to live in
+  `ToolRuntime`, not the scheduler.
+- The DAG scheduler's `max_execution_time_seconds` check only runs at loop
+  tick boundaries (same as cancellation), so an execution can overrun the
+  deadline by however long the longest in-flight task takes to reach its
+  next `await`.
+- `BLOCKED` is currently terminal for the specific task instance it's
+  applied to - a later successful replan doesn't "unblock" the original
+  task, it adds a fresh replacement task instead (consistent with how
+  `Planner.replan()` has always worked). There's no automatic "retarget
+  existing dependents onto the new replacement task" step; a replan's own
+  task list is responsible for depending on the right (old-succeeded or
+  new-replacement) task ids.

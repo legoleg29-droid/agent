@@ -248,6 +248,9 @@ def build_orchestrator(provider: LLMProvider, *, use_mock: bool) -> Orchestrator
         max_replans=int(os.environ.get("ORCHESTRATOR_MAX_REPLANS", 2)),
         state_store=state_store,
         long_term_memory=long_term_memory,
+        max_concurrent_tasks=int(os.environ.get("ORCHESTRATOR_MAX_CONCURRENT_TASKS", 5)),
+        retry_backoff_base_seconds=float(os.environ.get("ORCHESTRATOR_RETRY_BACKOFF_BASE_SECONDS", 0.5)),
+        max_retry_backoff_seconds=float(os.environ.get("ORCHESTRATOR_MAX_RETRY_BACKOFF_SECONDS", 10)),
     )
     orchestrator.tool_runtime.default_timeout_seconds = tool_timeout
     print(f"[main] Persisting execution state + memory to: {db_path}", file=sys.stderr)
@@ -276,6 +279,21 @@ def _print_result(result) -> None:
     print("=" * 72)
     for task in result.graph.topological_order():
         print(f"  [{task.status.value.upper():10}] {task.id} (agent={task.agent_id}, retries={task.retry_count})")
+
+    metrics = result.execution_state.metadata.get("scheduler_metrics")
+    if metrics:
+        print("\n" + "=" * 72)
+        print("SCHEDULER METRICS")
+        print("=" * 72)
+        print(
+            f"  total={metrics['total_tasks']} completed={metrics['completed_tasks']} "
+            f"failed={metrics['failed_tasks']} blocked={metrics['blocked_tasks']} "
+            f"cancelled={metrics['cancelled_tasks']} retried={metrics['retried_tasks']}"
+        )
+        print(
+            f"  peak_concurrency={metrics['peak_concurrency']} "
+            f"duration={metrics['execution_duration_seconds']:.2f}s"
+        )
 
     if result.tool_results:
         print("\n" + "=" * 72)

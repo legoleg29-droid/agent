@@ -4,11 +4,14 @@ USER -> ORCHESTRATOR -> PLANNER -> TASK GRAPH -> SCHEDULER -> AGENT RUNTIME
      -> CONTEXT MANAGER -> MEMORY / STATE -> TOOL RUNTIME -> EVALUATOR
      -> CHECKPOINT -> REPLAN / COMPLETE
 
-The scheduler respects task dependencies and runs independent ready tasks
-concurrently via ``asyncio.gather``. Every important transition (plan
-creation, task start, task completion, task failure, replan, execution
-completion) is checkpointed through a pluggable ``StateStore`` so a run can
-be reconstructed and resumed after a crash without re-executing completed
+Dependency-aware, concurrency-bounded task dispatch is delegated to
+``DAGScheduler`` (``orchestrator/core/scheduler.py``); this module owns
+routing, agent execution, evaluation, retry/backoff, checkpointing, and
+replanning for one task, and interprets the scheduler's overall result.
+Every important transition (plan creation, task start, task completion,
+task failure, retry, replan, pause, cancellation, execution completion) is
+checkpointed through a pluggable ``StateStore`` so a run can be
+reconstructed and resumed after a crash without re-executing completed
 work - see ``resume_execution``.
 """
 
@@ -26,6 +29,7 @@ from orchestrator.core.logging_utils import EventLog
 from orchestrator.core.planner import Planner
 from orchestrator.core.retry import Action, RetryPolicy
 from orchestrator.core.router import AgentRouter
+from orchestrator.core.scheduler import DAGScheduler, ResourceLimits, SchedulerResult
 from orchestrator.core.state import RunStatus, StateManager
 from orchestrator.core.synthesizer import FinalResultSynthesizer
 from orchestrator.core.task_graph import Task, TaskGraph, TaskStatus
@@ -71,6 +75,10 @@ class Orchestrator:
         session_id: str | None = None,
         project_id: str | None = None,
         user_id: str | None = None,
+        max_concurrent_tasks: int = 5,
+        max_execution_time_seconds: float | None = None,
+        retry_backoff_base_seconds: float = 0.5,
+        max_retry_backoff_seconds: float = 10.0,
     ) -> None:
         self.provider = provider
         self.agent_registry = agent_registry
@@ -78,6 +86,10 @@ class Orchestrator:
         self.max_retries_per_task = max_retries_per_task
         self.max_replans = max_replans
         self.context_max_tokens = context_max_tokens
+        self.max_concurrent_tasks = max_concurrent_tasks
+        self.max_execution_time_seconds = max_execution_time_seconds
+        self.retry_backoff_base_seconds = retry_backoff_base_seconds
+        self.max_retry_backoff_seconds = max_retry_backoff_seconds
 
         self.event_log = EventLog(verbose=verbose_logging)
         self.tool_runtime = ToolRuntime(self.tool_registry, self.event_log)
@@ -99,6 +111,13 @@ class Orchestrator:
         # so replan budget is scoped to one execution, not shared across
         # multiple run() calls on the same Orchestrator instance.
         self.state = StateManager(max_replans=max_replans)
+
+        # Live DAGScheduler instances, keyed by execution_id, for as long as
+        # a run()/resume_execution() call is in flight on this Orchestrator -
+        # lets pause_execution()/cancel_execution() signal a run that's
+        # actually executing right now (from another coroutine/task), not
+        # just a persisted-but-not-live one.
+        self._active_schedulers: dict[str, DAGScheduler] = {}
 
     # -- Public entry points ---------------------------------------------
 
@@ -161,6 +180,7 @@ class Orchestrator:
                 "reset_tasks": [t.id for t in reset_tasks],
             },
         )
+        self.event_log.emit("EXECUTION_RESUMED", f"Execution '{execution_id}' resumed", extra={"execution_id": execution_id})
 
         context = ContextManager(goal=state.user_goal, started_at=state.created_at)
         context.global_context.update(state.context)
@@ -179,11 +199,36 @@ class Orchestrator:
         return await self._execute_loop(state.user_goal, graph, context, state, memory_manager)
 
     def cancel_execution(self, execution_id: str) -> None:
+        """Request cancellation. If this execution is actively running on
+        this Orchestrator instance, signals the live scheduler (which stops
+        starting new tasks, cancels in-flight ones, and marks every
+        unfinished task CANCELLED - never marks anything unfinished as
+        completed) - its own completion path persists the final state.
+        Otherwise, best-effort: mark the persisted (not currently running)
+        execution CANCELLED directly."""
+        scheduler = self._active_schedulers.get(execution_id)
+        if scheduler is not None:
+            scheduler.request_cancel()
+            return
         state = self.state_store.load(execution_id)
         if state is None:
             raise ExecutionNotFoundError(f"No persisted execution found for id '{execution_id}'")
         state.set_status(ExecutionStatus.CANCELLED)
         self.state_store.checkpoint(state, self.event_log, "cancelled")
+
+    def pause_execution(self, execution_id: str) -> None:
+        """Request a pause: stop scheduling new tasks, let currently running
+        ones finish, then persist PAUSED. If not live on this instance,
+        best-effort marks the persisted execution PAUSED directly."""
+        scheduler = self._active_schedulers.get(execution_id)
+        if scheduler is not None:
+            scheduler.request_pause()
+            return
+        state = self.state_store.load(execution_id)
+        if state is None:
+            raise ExecutionNotFoundError(f"No persisted execution found for id '{execution_id}'")
+        state.set_status(ExecutionStatus.PAUSED)
+        self.state_store.checkpoint(state, self.event_log, "paused")
 
     # -- Execution loop -----------------------------------------------------
 
@@ -195,43 +240,70 @@ class Orchestrator:
         execution_state: ExecutionState,
         memory_manager: MemoryManager,
     ) -> OrchestrationResult:
-        aborted = False
-        while not graph.is_complete():
-            ready = graph.get_ready_tasks()
-            if not ready:
-                if graph.has_pending_work():
-                    skipped = graph.mark_unreachable_as_skipped()
-                    if skipped:
-                        for task in skipped:
-                            execution_state.sync_task_state(task)
-                        continue
-                break
+        """Delegates dependency-aware, concurrency-bounded dispatch to
+        ``DAGScheduler`` - this method owns interpreting the scheduler's
+        result into execution status/output, not the scheduling itself."""
 
-            for task in ready:
-                task.status = TaskStatus.RUNNING
+        async def execute_task(task: Task) -> Action:
+            return await self._run_task(task, graph, context, execution_state, memory_manager)
 
-            results = await asyncio.gather(
-                *(self._run_task(task, graph, context, execution_state, memory_manager) for task in ready)
+        async def on_replan_needed(task: Task) -> bool:
+            return await self._replan(goal, graph, context, task, execution_state)
+
+        def checkpoint() -> None:
+            self._checkpoint(execution_state, graph, "scheduler")
+
+        scheduler = DAGScheduler(
+            graph,
+            execute_task=execute_task,
+            resource_limits=ResourceLimits(
+                max_concurrent_tasks=self.max_concurrent_tasks,
+                max_execution_time_seconds=self.max_execution_time_seconds,
+            ),
+            event_log=self.event_log,
+            execution_id=execution_state.execution_id,
+            checkpoint=checkpoint,
+            on_replan_needed=on_replan_needed,
+        )
+        self._active_schedulers[execution_state.execution_id] = scheduler
+        try:
+            result = await scheduler.run()
+        finally:
+            self._active_schedulers.pop(execution_state.execution_id, None)
+
+        scheduler.metrics.retried_tasks = sum(1 for t in graph.tasks.values() if t.retry_count > 0)
+        execution_state.metadata["scheduler_metrics"] = scheduler.metrics.to_dict()
+        execution_state.current_plan = graph.to_dict()
+
+        if result == SchedulerResult.PAUSED:
+            execution_state.set_status(ExecutionStatus.PAUSED)
+            self.event_log.emit(
+                "EXECUTION_PAUSED", f"Execution '{execution_state.execution_id}' paused", extra={"execution_id": execution_state.execution_id}
+            )
+            self._checkpoint(execution_state, graph, "execution paused")
+            return OrchestrationResult(
+                goal=goal,
+                final_output="",
+                graph=graph,
+                events=[e.to_dict() for e in self.event_log.events],
+                tool_results=context.tool_results,
+                succeeded=False,
+                execution_id=execution_state.execution_id,
+                execution_state=execution_state,
             )
 
-            for task, action in zip(ready, results):
-                if action == Action.REPLAN:
-                    replanned = await self._replan(goal, graph, context, task, execution_state)
-                    if not replanned:
-                        aborted = True
-                elif action == Action.ABORT:
-                    aborted = True
+        succeeded = result == SchedulerResult.COMPLETED
+        cancelled = result == SchedulerResult.CANCELLED
+        final_output = (
+            "Execution was cancelled." if cancelled else await self.synthesizer.synthesize(goal, graph, context)
+        )
 
-            if aborted:
-                for task in graph.mark_unreachable_as_skipped():
-                    execution_state.sync_task_state(task)
-                break
-
-        succeeded = not graph.failed_tasks() and not aborted
-        final_output = await self.synthesizer.synthesize(goal, graph, context)
-
-        execution_state.current_plan = graph.to_dict()
-        execution_state.set_status(ExecutionStatus.COMPLETED if succeeded else ExecutionStatus.FAILED)
+        new_status = (
+            ExecutionStatus.CANCELLED
+            if cancelled
+            else (ExecutionStatus.COMPLETED if succeeded else ExecutionStatus.FAILED)
+        )
+        execution_state.set_status(new_status)
         self.state.transition(RunStatus.COMPLETED if succeeded else RunStatus.FAILED)
         self._checkpoint(execution_state, graph, "execution completion")
 
@@ -353,14 +425,29 @@ class Orchestrator:
                 self._extract_memory(task, output, memory_manager)
         elif action == Action.RETRY:
             task.retry_count += 1
-            task.status = TaskStatus.PENDING
+            task.status = TaskStatus.RETRYING
             execution_state.sync_task_state(task)
+            backoff_seconds = self._retry_backoff_seconds(task.retry_count)
             self.event_log.emit(
                 "RETRY",
                 f"Retrying task '{task.id}' (attempt {task.retry_count}/{task.max_retries})",
                 task_id=task.id,
                 retry_count=task.retry_count,
             )
+            self.event_log.emit(
+                "TASK_RETRYING",
+                f"Task '{task.id}' backing off {backoff_seconds:.2f}s before attempt {task.retry_count + 1}",
+                task_id=task.id,
+                agent_id=agent.id,
+                status="retrying",
+                retry_count=task.retry_count,
+                extra={"backoff_seconds": backoff_seconds},
+            )
+            self._checkpoint(execution_state, graph, "task retrying")
+            if backoff_seconds > 0:
+                await asyncio.sleep(backoff_seconds)
+            task.status = TaskStatus.RUNNING
+            execution_state.sync_task_state(task)
             action = await self._run_task(task, graph, context, execution_state, memory_manager)
         elif action == Action.REPLAN:
             task.status = TaskStatus.FAILED
@@ -378,6 +465,11 @@ class Orchestrator:
             self._checkpoint(execution_state, graph, "task failure")
 
         return action
+
+    def _retry_backoff_seconds(self, attempt: int) -> float:
+        """Exponential backoff, capped, so a flaky task doesn't hammer the
+        agent/tool immediately: attempt 1 -> base, attempt 2 -> 2x base, ..."""
+        return min(self.max_retry_backoff_seconds, self.retry_backoff_base_seconds * (2 ** max(0, attempt - 1)))
 
     def _checkpoint(self, execution_state: ExecutionState, graph: TaskGraph, reason: str) -> None:
         """Refresh the persisted plan snapshot from the live graph (so a
